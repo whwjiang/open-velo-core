@@ -1,6 +1,0 @@
-{
-  "summary": "Implementation plan for VeloCore WASM, a browser-based cycling workout and hardware telemetry platform powered by a Rust-to-WASM binary protocol engine supporting WebUSB ANT+, WebBluetooth BLE, bidirectional smart trainer control (ERG, Resistance, Slope), ZWO/FIT workout import/export, synthetic packet generation, and real-time hex inspection.",
-  "updatedAt": "2026-11-03T23:07:05.653119174Z",
-  "requestFeedback": true,
-  "userFacing": true
-}
