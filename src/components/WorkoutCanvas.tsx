@@ -412,7 +412,7 @@ export const WorkoutCanvas: React.FC<WorkoutCanvasProps> = ({
       {/* Bottom Legend & Interval Jump Strip */}
       <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-200 dark:border-slate-800 text-xs text-slate-500 dark:text-slate-400">
         <div className="flex items-center gap-3">
-          <span>Click any interval block to jump playhead &amp; transmit new ANT+ FE-C / BLE FTMS target</span>
+          <span>Click any interval block to jump to that segment</span>
         </div>
         <div className="flex items-center gap-3 font-mono tabular-nums">
           <span className="text-cyan-600 dark:text-cyan-400">━ 3s Power ({snapshot.power3sWatts}W)</span>

@@ -2,6 +2,7 @@ import { VeloCoreWasmRuntime } from '../wasm/wasmBinary';
 import {
   ConnectedSensorDevice,
   DecodedByteField,
+  IntervalCompletionReport,
   ProtocolFrameAudit,
   StructuredWorkout,
   SyntheticGeneratorConfig,
@@ -10,11 +11,17 @@ import {
   TrainerControlMode,
   TransportProtocol,
 } from './types';
-import { BUILTIN_WORKOUTS } from './workouts';
+import {
+  BUILTIN_WORKOUTS,
+  encodeTelemetryToFitBinary,
+  loadRiderProfileFromTxtFile,
+  saveRiderProfileToTxtFile,
+} from './workouts';
 
 type TelemetryListener = (snapshot: TelemetrySnapshot) => void;
 type FrameAuditListener = (frames: ProtocolFrameAudit[]) => void;
 type DeviceRosterListener = (devices: ConnectedSensorDevice[]) => void;
+type IntervalCompletionListener = (report: IntervalCompletionReport) => void;
 
 const toHex = (b: number) => b.toString(16).toUpperCase().padStart(2, '0');
 const bytesToHex = (arr: Uint8Array | number[]) =>
@@ -31,10 +38,12 @@ export class VeloCoreEngine {
   private telemetryListeners = new Set<TelemetryListener>();
   private frameListeners = new Set<FrameAuditListener>();
   private deviceListeners = new Set<DeviceRosterListener>();
+  private intervalCompletionListeners = new Set<IntervalCompletionListener>();
 
   // Workout & Clock State
   private activeWorkout: StructuredWorkout = BUILTIN_WORKOUTS[0];
-  private isRiding = true;
+  private isRiding = false;
+  private userPausedManually = false;
   private elapsedSec = 0;
   private tickTimer: number | null = null;
   private synthTimer: number | null = null;
@@ -54,6 +63,9 @@ export class VeloCoreEngine {
   private powerRing3s: number[] = [];
   private powerRing10s: number[] = [];
   private powerRing30s: number[] = [];
+  private powerSampleWindow: Array<{ ts: number; watts: number }> = [];
+  private intervalPowerSum = 0;
+  private intervalPowerSamples = 0;
   private fourthPowerSum = 0;
   private fourthPowerCount = 0;
   private powerSum = 0;
@@ -74,17 +86,20 @@ export class VeloCoreEngine {
   private prevBleCrankTime1024 = 0;
   private prevAntSpeedTime1024 = 0;
   private prevAntWheelRevs = -1;
+  private lastPowerPacketMs = 0;
+  private lastHrPacketMs = 0;
+  private lastSpeedPacketMs = 0;
 
   // Instantaneous Sensor Values
-  private currentPowerWatts = 165;
-  private currentHrBpm = 128;
-  private currentCadenceRpm = 90;
-  private currentSpeedKph = 31.4;
+  private currentPowerWatts = 0;
+  private currentHrBpm = 0;
+  private currentCadenceRpm = 0;
+  private currentSpeedKph = 0;
   private currentLRBalance = 50;
 
   // Synthetic Wire Counter State
   private synthConfig: SyntheticGeneratorConfig = {
-    enabled: true,
+    enabled: false,
     frequencyHz: 4,
     protocolMix: 'BOTH',
     baseRiderEffortOffsetWatts: 0,
@@ -122,10 +137,17 @@ export class VeloCoreEngine {
 
   async start(): Promise<void> {
     await this.wasm.init();
+    const savedProfile = await loadRiderProfileFromTxtFile();
+    if (savedProfile) {
+      this.ftpWatts = savedProfile.ftpWatts;
+      this.riderWeightKg = savedProfile.weightKg;
+    }
+    this.wasm.sessionSetRiderProfile(this.ftpWatts, this.riderWeightKg, this.wPrimeMaxJoules);
     this.startWorkoutClock();
     this.restartSyntheticWireLoop();
     // Dispatch initial ERG command frame so the protocol inspector immediately shows outbound wire encoding
     this.dispatchSmartTrainerCommand();
+    this.emitTelemetry();
   }
 
   stop(): void {
@@ -159,6 +181,16 @@ export class VeloCoreEngine {
     this.deviceListeners.add(cb);
     cb(Array.from(this.devices.values()));
     return () => this.deviceListeners.delete(cb);
+  }
+
+  /**
+   * Plug-and-play hook for game frontends (e.g. Newspaper Delivery Game):
+   * Fires whenever a workout interval (house delivery block) completes with its
+   * compliance score, delivery tier (0..3), and coins earned.
+   */
+  subscribeIntervalCompletions(cb: IntervalCompletionListener): () => void {
+    this.intervalCompletionListeners.add(cb);
+    return () => this.intervalCompletionListeners.delete(cb);
   }
 
   private emitTelemetry(): void {
@@ -325,19 +357,34 @@ export class VeloCoreEngine {
       });
       this.emitDevices();
 
-      // Send ANT+ ResetSystem (0x4A) and SetNetworkKey (0x46) for official ANT+ key
-      await this.sendAntUsbRaw(new Uint8Array([0xa4, 0x01, 0x4a, 0x00, 0xef]));
-      await this.sendAntUsbRaw(
-        new Uint8Array([
-          0xa4, 0x09, 0x46, 0x00, 0xb9, 0xa5, 0x21, 0xfb, 0xbd, 0x72, 0xc3, 0x45, 0x64,
-        ])
-      );
+      // Automatically pause the Synthetic Wire Generator so live ANT+ telemetry drives the gauges
+      if (this.synthConfig.enabled) {
+        this.updateSyntheticConfig({ enabled: false });
+      }
 
-      // Start background bulk IN read loop
+      // Start background bulk IN read loop before sending initialization commands
       this.pollAntUsbLoop();
+
+      // Send ANT+ ResetSystem (0x4A) and wait 550ms per Dynastream USB stick specification
+      await this.sendAntUsbCommand(0x4a, [0x00]);
+      await this.delayMs(550);
+
+      // SetNetworkKey (0x46) on Network #0 with official ANT+ network key (B9 A5 21 FB BD 72 C3 45)
+      await this.sendAntUsbCommand(0x46, [
+        0x00, 0xb9, 0xa5, 0x21, 0xfb, 0xbd, 0x72, 0xc3, 0x45,
+      ]);
+      await this.delayMs(50);
+
+      // Open Channel 0: ANT+ FE-C Smart Trainer (Device Type 17 = 0x11, Period 8192 = 4.00 Hz, 2457 MHz)
+      await this.openAntSlaveChannel(0, 17, 8192);
+      // Open Channel 1: ANT+ Cycling Power Meter (Device Type 11 = 0x0B, Period 8182 = 4.005 Hz, 2457 MHz)
+      await this.openAntSlaveChannel(1, 11, 8182);
+      // Open Channel 2: ANT+ Heart Rate Monitor (Device Type 120 = 0x78, Period 8070 = 4.06 Hz, 2457 MHz)
+      await this.openAntSlaveChannel(2, 120, 8070);
+
       return {
         ok: true,
-        message: `Connected to ${device.productName || 'ANT+ USB Dongle'} on Bulk EP #${this.usbInEndpoint}.`,
+        message: `Connected to ${device.productName || 'ANT+ USB Dongle'} on Bulk EP #${this.usbInEndpoint}. Listening on 2457 MHz for FE-C Trainer (Ch 0), Power (Ch 1), and HRM (Ch 2).`,
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -346,6 +393,66 @@ export class VeloCoreEngine {
         message: `WebUSB connection canceled or blocked: ${msg}`,
       };
     }
+  }
+
+  private delayMs(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Builds and sends a valid ANT+ serial message `[0xA4, len, msgId, ...payload, xorChecksum]`
+   */
+  private async sendAntUsbCommand(msgId: number, payload: number[]): Promise<void> {
+    const frame = new Uint8Array(payload.length + 4);
+    frame[0] = 0xa4;
+    frame[1] = payload.length;
+    frame[2] = msgId;
+    for (let i = 0; i < payload.length; i++) {
+      frame[3 + i] = payload[i] & 0xff;
+    }
+    let xor = 0;
+    for (let i = 0; i < frame.length - 1; i++) {
+      xor ^= frame[i];
+    }
+    frame[frame.length - 1] = xor;
+    await this.sendAntUsbRaw(frame);
+  }
+
+  /**
+   * Configures and opens an ANT+ wildcard slave channel on Network #0 (2457 MHz)
+   */
+  private async openAntSlaveChannel(
+    channel: number,
+    deviceType: number,
+    channelPeriod: number
+  ): Promise<void> {
+    // 1. AssignChannel (0x42): [Channel, ChannelType=0x00 (Bidirectional Slave), NetworkNumber=0x00]
+    await this.sendAntUsbCommand(0x42, [channel, 0x00, 0x00]);
+    await this.delayMs(25);
+
+    // 2. SetChannelId (0x51): [Channel, DevNumLSB=0, DevNumMSB=0 (Wildcard), DeviceType, TransType=0 (Wildcard)]
+    await this.sendAntUsbCommand(0x51, [channel, 0x00, 0x00, deviceType & 0xff, 0x00]);
+    await this.delayMs(25);
+
+    // 3. SetChannelRfFreq (0x45): [Channel, RfFreq=57 (2457 MHz official ANT+ frequency)]
+    await this.sendAntUsbCommand(0x45, [channel, 57]);
+    await this.delayMs(25);
+
+    // 4. SetChannelPeriod (0x43): [Channel, PeriodLSB, PeriodMSB]
+    await this.sendAntUsbCommand(0x43, [
+      channel,
+      channelPeriod & 0xff,
+      (channelPeriod >> 8) & 0xff,
+    ]);
+    await this.delayMs(25);
+
+    // 5. SetChannelSearchTimeout (0x44): [Channel, Timeout=255 (Infinite / continuous search)]
+    await this.sendAntUsbCommand(0x44, [channel, 0xff]);
+    await this.delayMs(25);
+
+    // 6. OpenChannel (0x4B): [Channel]
+    await this.sendAntUsbCommand(0x4b, [channel]);
+    await this.delayMs(25);
   }
 
   private async sendAntUsbRaw(frame: Uint8Array): Promise<void> {
@@ -362,7 +469,11 @@ export class VeloCoreEngine {
       try {
         const result = await this.usbDevice.transferIn(this.usbInEndpoint, 64);
         if (result.data && result.data.byteLength > 0) {
-          const bytes = new Uint8Array(result.data.buffer);
+          const bytes = new Uint8Array(
+            result.data.buffer,
+            result.data.byteOffset,
+            result.data.byteLength
+          );
           this.ingestAntUsbStream(bytes, 'ANT+_USB');
         }
       } catch {
@@ -445,6 +556,11 @@ export class VeloCoreEngine {
         } catch {
           // Optional control point
         }
+      }
+
+      // Automatically pause the Synthetic Wire Generator so live BLE telemetry drives the gauges
+      if (this.synthConfig.enabled) {
+        this.updateSyntheticConfig({ enabled: false });
       }
 
       await characteristic.startNotifications();
@@ -566,23 +682,28 @@ export class VeloCoreEngine {
         const accumPower = frame[7] | (frame[8] << 8);
         const instPower = frame[9] | ((frame[10] & 0x0f) << 8);
 
-        if (this.prevAntPowerEventCount >= 0) {
-          const evtDelta = this.wasm.u8Delta(eventCount, this.prevAntPowerEventCount);
-          const pwrDelta = this.wasm.u16Delta(accumPower, this.prevAntAccumulatedPower);
-          if (evtDelta > 0) {
-            this.currentPowerWatts = Math.max(0, Math.min(2500, instPower));
-          } else if (pwrDelta >= 0) {
-            this.currentPowerWatts = Math.max(0, Math.min(2500, instPower));
+        // 0xFFF (4095) means invalid/computed power unavailable per ANT+ FE-C spec
+        let nextPower = this.currentPowerWatts;
+        if (instPower !== 0xfff) {
+          if (this.prevAntPowerEventCount >= 0) {
+            const evtDelta = this.wasm.u8Delta(eventCount, this.prevAntPowerEventCount);
+            const pwrDelta = this.wasm.u16Delta(accumPower, this.prevAntAccumulatedPower);
+            if (evtDelta > 0 && evtDelta < 32) {
+              nextPower = Math.max(0, Math.min(2500, instPower));
+            } else if (pwrDelta >= 0) {
+              nextPower = Math.max(0, Math.min(2500, instPower));
+            }
+          } else {
+            nextPower = Math.max(0, Math.min(2500, instPower));
           }
-        } else {
-          this.currentPowerWatts = Math.max(0, Math.min(2500, instPower));
         }
         this.prevAntPowerEventCount = eventCount;
         this.prevAntAccumulatedPower = accumPower;
 
-        if (instCadence !== 0xff && instCadence > 0) {
+        if (instCadence !== 0xff && instCadence >= 0) {
           this.currentCadenceRpm = instCadence;
         }
+        this.recordPowerMeasurement(nextPower);
 
         summary = `FE-C Trainer · ${this.currentPowerWatts} W · ${this.currentCadenceRpm} RPM · Evt #${eventCount}`;
         fields.push(
@@ -613,14 +734,19 @@ export class VeloCoreEngine {
         );
       } else if (channel === 0 && dataPage === 0x10) {
         // ANT+ FE-C Data Page 16 (0x10): General FE Speed & Distance
+        // Byte 4 = 0x10, Byte 5 = Equipment Type, Byte 6 = Elapsed Time (0.25s), Byte 7 = Distance (m), Bytes 8..9 = Speed LSB/MSB (mm/s), Byte 10 = HR
         messageName = 'ANT+ FE-C Page 16 (General FE Kinematics)';
-        const elapsedQuarterSec = frame[5];
-        const distMeters = frame[6];
-        const rawSpeedMmS = frame[7] | (frame[8] << 8);
-        const speedKph = Number(((rawSpeedMmS / 1000) * 3.6).toFixed(1));
-        if (speedKph > 0 && speedKph < 110) {
-          this.currentSpeedKph = speedKph;
+        const elapsedQuarterSec = frame[6];
+        const distMeters = frame[7];
+        const rawSpeedMmS = frame[8] | (frame[9] << 8);
+        if (rawSpeedMmS !== 0xffff) {
+          const speedKph = Number(((rawSpeedMmS / 1000) * 3.6).toFixed(1));
+          if (speedKph >= 0 && speedKph < 110) {
+            this.currentSpeedKph = speedKph;
+            this.lastSpeedPacketMs = Date.now();
+          }
         }
+        this.emitTelemetry();
         summary = `FE-C Speed · ${this.currentSpeedKph.toFixed(1)} km/h · +${distMeters & 0x0f}m`;
         fields.push(
           {
@@ -632,10 +758,10 @@ export class VeloCoreEngine {
             category: 'PAGE_OPCODE',
           },
           {
-            offset: 5,
+            offset: 6,
             length: 4,
             label: 'Elapsed / Dist / Speed',
-            rawHex: `${toHex(elapsedQuarterSec)} ${toHex(distMeters)} ${toHex(frame[7])} ${toHex(frame[8])}`,
+            rawHex: `${toHex(elapsedQuarterSec)} ${toHex(distMeters)} ${toHex(frame[8])} ${toHex(frame[9])}`,
             decodedValue: `${this.currentSpeedKph.toFixed(1)} km/h (${rawSpeedMmS} mm/s)`,
             category: 'TELEMETRY',
           }
@@ -648,6 +774,9 @@ export class VeloCoreEngine {
         const computedBpm = frame[11];
         if (computedBpm > 35 && computedBpm < 240) {
           this.currentHrBpm = computedBpm;
+          this.lastHrPacketMs = Date.now();
+          if (computedBpm > this.maxHrBpm) this.maxHrBpm = computedBpm;
+          this.emitTelemetry();
         }
         summary = `ANT+ HRM · ${this.currentHrBpm} BPM · Beat #${beatCount} (${beatTime1024}/1024s)`;
         fields.push(
@@ -668,13 +797,21 @@ export class VeloCoreEngine {
             category: 'TELEMETRY',
           }
         );
-      } else {
-        // Generic ANT+ Power Page 0x10
+      } else if (channel === 1 && dataPage === 0x10) {
+        // ANT+ Cycling Power Standard Power-Only Page 16 (0x10) on Channel 1
+        messageName = 'ANT+ Power Page 16 (Standard Power-Only)';
+        const instCadence = frame[7];
         const instPower = frame[10] | (frame[11] << 8);
-        if (instPower > 0 && instPower < 2500) {
-          this.currentPowerWatts = instPower;
+        if (instCadence !== 0xff && instCadence >= 0) {
+          this.currentCadenceRpm = instCadence;
         }
-        summary = `ANT+ Ch #${channel} Page 0x${toHex(dataPage)} · ${instPower} W`;
+        if (instPower >= 0 && instPower < 2500) {
+          this.recordPowerMeasurement(instPower);
+        }
+        summary = `ANT+ Power Ch #1 · ${this.currentPowerWatts} W · ${this.currentCadenceRpm} RPM`;
+      } else {
+        // Other ANT+ FE-C / Sensor status pages (e.g. Page 80/81 Manufacturer/Product Info)
+        summary = `ANT+ Ch #${channel} Page 0x${toHex(dataPage)}`;
       }
     }
 
@@ -725,7 +862,6 @@ export class VeloCoreEngine {
       const crankRevs = raw[5] | (raw[6] << 8);
       const crankTime1024 = raw.length >= 9 ? raw[7] | (raw[8] << 8) : 0;
 
-      this.currentPowerWatts = Math.max(0, Math.min(2500, instWatts));
       if (pedalBalanceHalfPct > 0 && pedalBalanceHalfPct <= 200) {
         this.currentLRBalance = Math.round(pedalBalanceHalfPct / 2);
       }
@@ -742,6 +878,7 @@ export class VeloCoreEngine {
       }
       this.prevBleCrankRevs = crankRevs;
       this.prevBleCrankTime1024 = crankTime1024;
+      this.recordPowerMeasurement(Math.max(0, Math.min(2500, instWatts)));
 
       summary = `BLE Power · ${this.currentPowerWatts} W · ${this.currentCadenceRpm} RPM · Balance ${this.currentLRBalance}/${100 - this.currentLRBalance}%`;
       fields.push(
@@ -786,6 +923,9 @@ export class VeloCoreEngine {
       const bpm = is16Bit && raw.length >= 3 ? raw[1] | (raw[2] << 8) : raw[1];
       if (bpm > 35 && bpm < 245) {
         this.currentHrBpm = bpm;
+        this.lastHrPacketMs = Date.now();
+        if (bpm > this.maxHrBpm) this.maxHrBpm = bpm;
+        this.emitTelemetry();
       }
       const rrMs = raw.length >= 4 ? Math.round(((raw[2] | (raw[3] << 8)) / 1024) * 1000) : Math.round(60000 / Math.max(60, this.currentHrBpm));
       summary = `BLE HRM · ${this.currentHrBpm} BPM · RR ${rrMs} ms`;
@@ -814,8 +954,9 @@ export class VeloCoreEngine {
       const rawCadence = raw[4] | (raw[5] << 8); // 0.5 rpm resolution
       const rawPower = raw[6] | (raw[7] << 8); // 1 W resolution
       this.currentSpeedKph = Number((rawSpeed / 100).toFixed(1));
+      this.lastSpeedPacketMs = Date.now();
       this.currentCadenceRpm = Math.round(rawCadence / 2);
-      this.currentPowerWatts = rawPower;
+      this.recordPowerMeasurement(Math.max(0, Math.min(2500, rawPower)));
       summary = `BLE FTMS · ${rawPower} W · ${this.currentCadenceRpm} RPM · ${this.currentSpeedKph} km/h`;
     } else {
       summary = `BLE Payload (${raw.length} bytes)`;
@@ -928,9 +1069,18 @@ export class VeloCoreEngine {
     this.emitTelemetry();
   }
 
-  setRiderProfile(ftpWatts: number, weightKg: number): void {
-    this.ftpWatts = Math.max(100, Math.min(550, Math.round(ftpWatts)));
-    this.riderWeightKg = Math.max(40, Math.min(140, Number(weightKg.toFixed(1))));
+  setRiderProfile(ftpWatts: number, weightKg: number, persist = true): void {
+    const safeFtp = Number.isFinite(ftpWatts) ? ftpWatts : 0;
+    const safeWeight = Number.isFinite(weightKg) ? weightKg : 0;
+    this.ftpWatts = Math.max(0, Math.min(1000, Math.round(safeFtp)));
+    this.riderWeightKg = Math.max(0, Math.min(300, Number(safeWeight.toFixed(1))));
+    this.wasm.sessionSetRiderProfile(this.ftpWatts, this.riderWeightKg, this.wPrimeMaxJoules);
+    if (persist) {
+      void saveRiderProfileToTxtFile({
+        ftpWatts: this.ftpWatts,
+        weightKg: this.riderWeightKg,
+      });
+    }
     if (this.trainerMode === 'ERG') {
       this.dispatchSmartTrainerCommand();
     }
@@ -1107,31 +1257,66 @@ export class VeloCoreEngine {
   }
 
   private zeroOutSyntheticValues(): void {
-    // Check if any physical USB or BLE device has sent packets recently (< 2.5s)
+    // Clear synthetic values and any metric that has not received a live packet recently
     const now = Date.now();
-    let hasPhysicalStream = false;
-    for (const dev of this.devices.values()) {
-      if (
-        (dev.protocol === 'ANT+_USB' || dev.protocol === 'BLE_GATT') &&
-        dev.status === 'CONNECTED' &&
-        now - dev.lastSeenMs < 2500
-      ) {
-        hasPhysicalStream = true;
+    this.synthPhysiologicalPower = 0;
+    this.synthPhysiologicalHr = 60;
+
+    if (now - this.lastPowerPacketMs > 2500) {
+      this.currentPowerWatts = 0;
+      this.currentCadenceRpm = 0;
+      this.powerRing3s = [];
+      this.powerRing10s = [];
+      this.powerSampleWindow = [];
+    }
+    if (now - this.lastSpeedPacketMs > 2500) {
+      this.currentSpeedKph = 0;
+    }
+    if (now - this.lastHrPacketMs > 3000) {
+      this.currentHrBpm = 0;
+    }
+  }
+
+  /**
+   * Records a fresh power sample from ANT+ / BLE / Synthetic wire, updating the
+   * time-based 3000ms rolling window, max power, and emitting live telemetry immediately.
+   */
+  private recordPowerMeasurement(watts: number): void {
+    const now = Date.now();
+    const clamped = Math.max(0, Math.min(2500, Math.round(watts)));
+    this.currentPowerWatts = clamped;
+    this.lastPowerPacketMs = now;
+    if (clamped > this.maxPowerWatts) {
+      this.maxPowerWatts = clamped;
+    }
+    if (!this.isRiding && !this.userPausedManually && clamped > 5) {
+      this.isRiding = true;
+    }
+    this.wasm.sessionRecordPowerSample(clamped, now);
+    this.powerSampleWindow.push({ ts: now, watts: clamped });
+    const cutoff30s = now - 30000;
+    while (this.powerSampleWindow.length > 0 && this.powerSampleWindow[0].ts < cutoff30s) {
+      this.powerSampleWindow.shift();
+    }
+    this.emitTelemetry();
+  }
+
+  private computeTimeWindowPowerAvg(windowMs: number): number {
+    const now = Date.now();
+    const cutoff = now - windowMs;
+    let sum = 0;
+    let count = 0;
+    for (let i = this.powerSampleWindow.length - 1; i >= 0; i--) {
+      const sample = this.powerSampleWindow[i];
+      if (sample.ts >= cutoff) {
+        sum += sample.watts;
+        count++;
+      } else {
         break;
       }
     }
-
-    if (!hasPhysicalStream) {
-      this.currentPowerWatts = 0;
-      this.currentCadenceRpm = 0;
-      this.currentSpeedKph = 0;
-      this.powerRing3s = [];
-      this.powerRing10s = [];
-      this.synthPhysiologicalPower = 0;
-      // Heart rate slowly decays to resting baseline or 0
-      this.synthPhysiologicalHr = 60;
-      this.currentHrBpm = 0;
-    }
+    const tsFallback = count > 0 ? Math.round(sum / count) : this.currentPowerWatts;
+    return this.wasm.sessionGetWindowPowerAvg(windowMs, now, tsFallback);
   }
 
   private restartSyntheticWireLoop(): void {
@@ -1312,45 +1497,73 @@ export class VeloCoreEngine {
   private startWorkoutClock(): void {
     if (this.tickTimer !== null) return;
     this.tickTimer = window.setInterval(() => {
+      // Expire stale individual sensor metrics if synthetic generator is off
+      if (!this.synthConfig.enabled) {
+        const now = Date.now();
+        if (this.lastPowerPacketMs === 0 || now - this.lastPowerPacketMs > 2500) {
+          this.currentPowerWatts = 0;
+          this.currentCadenceRpm = 0;
+          this.powerRing3s = [];
+          this.powerSampleWindow = [];
+        }
+        if (this.lastSpeedPacketMs === 0 || now - this.lastSpeedPacketMs > 2500) {
+          this.currentSpeedKph = 0;
+        }
+        if (this.lastHrPacketMs === 0 || now - this.lastHrPacketMs > 4000) {
+          this.currentHrBpm = 0;
+        }
+      }
+
       if (!this.isRiding) {
         this.emitTelemetry();
         return;
       }
 
-      // If synthetic generator is off, verify if physical sensors are active; otherwise decay/zero values
-      if (!this.synthConfig.enabled) {
-        const now = Date.now();
-        let hasPhysical = false;
-        for (const dev of this.devices.values()) {
-          if (
-            (dev.protocol === 'ANT+_USB' || dev.protocol === 'BLE_GATT') &&
-            dev.status === 'CONNECTED' &&
-            now - dev.lastSeenMs < 2500
-          ) {
-            hasPhysical = true;
-            break;
-          }
-        }
-        if (!hasPhysical) {
-          this.currentPowerWatts = 0;
-          this.currentCadenceRpm = 0;
-          this.currentSpeedKph = 0;
-          this.currentHrBpm = 0;
-          this.powerRing3s = [];
-        }
-      }
-
-      const prevSegIdx = this.getActiveSegmentPosition().index;
+      const prevPos = this.getActiveSegmentPosition();
+      const prevSegIdx = prevPos.index;
+      const prevTargetW = this.getCurrentTargetPowerWatts();
       this.elapsedSec++;
-      const nextSegIdx = this.getActiveSegmentPosition().index;
+      const nextPos = this.getActiveSegmentPosition();
+      const nextSegIdx = nextPos.index;
 
-      // If we crossed into a new workout interval in ERG mode, automatically encode & transmit new FE-C / FTMS command!
-      if (nextSegIdx !== prevSegIdx && this.trainerMode === 'ERG') {
-        this.dispatchSmartTrainerCommand();
+      // If we crossed into a new workout interval, score the completed interval in Rust WASM, emit completion report, and transmit new FE-C / FTMS command!
+      if (nextSegIdx !== prevSegIdx) {
+        const prevAvgPower =
+          this.intervalPowerSamples > 0
+            ? Math.round(this.intervalPowerSum / this.intervalPowerSamples)
+            : this.currentPowerWatts;
+        const rustReport = this.wasm.sessionCompleteInterval();
+        if (prevPos.segment) {
+          const report: IntervalCompletionReport = {
+            intervalIndex: prevSegIdx,
+            segmentId: prevPos.segment.id,
+            segmentName: prevPos.segment.name,
+            compliancePct: rustReport.compliancePct,
+            deliveryTier: rustReport.deliveryTier,
+            coinsEarned: rustReport.coinsEarned,
+            totalCoins: rustReport.totalCoins,
+            averagePowerWatts: prevAvgPower,
+            targetPowerWatts: prevTargetW,
+          };
+          for (const cb of this.intervalCompletionListeners) cb(report);
+        }
+        this.intervalPowerSum = 0;
+        this.intervalPowerSamples = 0;
+        if (this.trainerMode === 'ERG') {
+          this.dispatchSmartTrainerCommand();
+        }
       }
 
-      // Update rolling power windows (3s, 10s, 30s)
+      // Update rolling power windows (3s, 10s, 30s) & step Rust 1Hz session engine
       const pwr = this.currentPowerWatts;
+      this.wasm.sessionTick1Hz(
+        pwr,
+        this.currentHrBpm,
+        this.currentCadenceRpm,
+        this.currentSpeedKph,
+        this.getCurrentTargetPowerWatts(),
+        nextPos.segment?.targetCadenceRpm ?? 0
+      );
       this.powerRing3s.push(pwr);
       if (this.powerRing3s.length > 3) this.powerRing3s.shift();
 
@@ -1367,6 +1580,8 @@ export class VeloCoreEngine {
 
       this.powerSum += pwr;
       this.powerSamples++;
+      this.intervalPowerSum += pwr;
+      this.intervalPowerSamples++;
       if (pwr > this.maxPowerWatts) this.maxPowerWatts = pwr;
 
       this.hrSum += this.currentHrBpm;
@@ -1389,6 +1604,7 @@ export class VeloCoreEngine {
 
       const snap = this.getSnapshot();
       this.telemetryHistory.push({
+        timestampMs: Date.now(),
         elapsedSec: this.elapsedSec,
         powerWatts: snap.instantPowerWatts,
         power3sWatts: snap.power3sWatts,
@@ -1398,7 +1614,7 @@ export class VeloCoreEngine {
         speedKph: snap.speedKph,
         wPrimeBalancePct: snap.wPrimeBalancePct,
       });
-      if (this.telemetryHistory.length > 1800) {
+      if (this.telemetryHistory.length > 36000) {
         this.telemetryHistory.shift();
       }
 
@@ -1446,6 +1662,7 @@ export class VeloCoreEngine {
 
   toggleRidePause(): void {
     this.isRiding = !this.isRiding;
+    this.userPausedManually = !this.isRiding;
     this.emitTelemetry();
   }
 
@@ -1456,7 +1673,10 @@ export class VeloCoreEngine {
   selectWorkout(workout: StructuredWorkout): void {
     this.activeWorkout = workout;
     this.elapsedSec = 0;
+    this.userPausedManually = false;
     this.telemetryHistory = [];
+    this.intervalPowerSum = 0;
+    this.intervalPowerSamples = 0;
     this.wPrimeBalanceJoules = this.wPrimeMaxJoules;
     this.dispatchSmartTrainerCommand();
     this.emitTelemetry();
@@ -1474,17 +1694,24 @@ export class VeloCoreEngine {
       elapsed += segs[i].durationSec;
     }
     this.elapsedSec = elapsed;
+    this.intervalPowerSum = 0;
+    this.intervalPowerSamples = 0;
     this.dispatchSmartTrainerCommand();
     this.emitTelemetry();
   }
 
   resetSession(): void {
+    this.isRiding = false;
+    this.userPausedManually = false;
     this.elapsedSec = 0;
     this.telemetryHistory = [];
     this.wPrimeBalanceJoules = this.wPrimeMaxJoules;
     this.powerRing3s = [];
     this.powerRing10s = [];
     this.powerRing30s = [];
+    this.powerSampleWindow = [];
+    this.intervalPowerSum = 0;
+    this.intervalPowerSamples = 0;
     this.fourthPowerSum = 0;
     this.fourthPowerCount = 0;
     this.powerSum = 0;
@@ -1497,6 +1724,9 @@ export class VeloCoreEngine {
     this.cadenceSamples = 0;
     this.distanceMeters = 0;
     this.kilojoules = 0;
+    this.wasm.sessionReset();
+    this.wasm.sessionSetRiderProfile(this.ftpWatts, this.riderWeightKg, this.wPrimeMaxJoules);
+    this.zeroOutSyntheticValues();
     this.dispatchSmartTrainerCommand();
     this.emitTelemetry();
   }
@@ -1505,14 +1735,38 @@ export class VeloCoreEngine {
     return this.telemetryHistory;
   }
 
+  /**
+   * Encodes the current session history into a binary Garmin `.FIT` activity file
+   * using the Rust WASM `.FIT` encoder (with automatic TypeScript fallback).
+   */
+  encodeFitActivityBinary(): Uint8Array {
+    return (
+      this.wasm.encodeFitActivity(this.telemetryHistory) ??
+      encodeTelemetryToFitBinary(this.telemetryHistory)
+    );
+  }
+
   getSnapshot(): TelemetrySnapshot {
     const pos = this.getActiveSegmentPosition();
     const avg = (arr: number[], fallback: number) =>
       arr.length > 0 ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : fallback;
 
-    const pwr3s = avg(this.powerRing3s, this.currentPowerWatts);
-    const pwr10s = avg(this.powerRing10s, this.currentPowerWatts);
-    const pwr30s = avg(this.powerRing30s, this.currentPowerWatts);
+    const pwr3s =
+      this.powerSampleWindow.length > 0
+        ? this.computeTimeWindowPowerAvg(3000)
+        : avg(this.powerRing3s, this.currentPowerWatts);
+    const pwr10s =
+      this.powerSampleWindow.length > 0
+        ? this.computeTimeWindowPowerAvg(10000)
+        : avg(this.powerRing10s, this.currentPowerWatts);
+    const pwr30s =
+      this.powerSampleWindow.length > 0
+        ? this.computeTimeWindowPowerAvg(30000)
+        : avg(this.powerRing30s, this.currentPowerWatts);
+    const intervalPower =
+      this.intervalPowerSamples > 0
+        ? Math.round(this.intervalPowerSum / this.intervalPowerSamples)
+        : pwr3s;
     const np =
       this.fourthPowerCount > 0
         ? Math.round(Math.pow(this.fourthPowerSum / this.fourthPowerCount, 0.25))
@@ -1526,33 +1780,43 @@ export class VeloCoreEngine {
         ? Math.round(this.cadenceSum / this.cadenceSamples)
         : this.currentCadenceRpm;
 
-    const ifVal = Number((np / Math.max(100, this.ftpWatts)).toFixed(2));
-    const tssVal = Number(
-      (((this.elapsedSec * np * ifVal) / (this.ftpWatts * 3600)) * 100).toFixed(1)
-    );
+    const ifVal =
+      this.ftpWatts > 0 ? Number((np / this.ftpWatts).toFixed(2)) : 0;
+    const tssVal =
+      this.ftpWatts > 0
+        ? Number((((this.elapsedSec * np * ifVal) / (this.ftpWatts * 3600)) * 100).toFixed(1))
+        : 0;
     const frameRateHz = Number((this.recentFrameTimestamps.length / 3).toFixed(1));
+    const segDur = Math.max(1, pos.segment?.durationSec ?? 1);
+    const intervalProgress01 = Number(Math.min(1, Math.max(0, pos.segmentElapsed / segDur)).toFixed(4));
 
     return {
       timestampMs: Date.now(),
       elapsedSec: this.elapsedSec,
       intervalElapsedSec: pos.segmentElapsed,
       intervalRemainingSec: pos.segmentRemaining,
+      intervalProgress01,
       activeIntervalIndex: pos.index,
 
       instantPowerWatts: this.currentPowerWatts,
       power3sWatts: pwr3s,
       power10sWatts: pwr10s,
       power30sWatts: pwr30s,
+      intervalPowerWatts: intervalPower,
       normalizedPowerWatts: np,
       averagePowerWatts: avgPower,
       maxPowerWatts: Math.max(this.maxPowerWatts, this.currentPowerWatts),
-      wattsPerKg: Number((pwr3s / Math.max(40, this.riderWeightKg)).toFixed(2)),
+      wattsPerKg:
+        this.riderWeightKg > 0 ? Number((pwr3s / this.riderWeightKg).toFixed(2)) : 0,
 
       targetPowerWatts: this.getCurrentTargetPowerWatts(),
       trainerMode: this.trainerMode,
       targetSlopePct: this.targetSlopePct,
       targetResistancePct: this.targetResistancePct,
       intensityBiasPct: this.intensityBiasPct,
+      intervalCompliancePct: this.wasm.sessionGetIntervalCompliancePct(),
+      intervalCadenceCompliancePct: this.wasm.sessionGetIntervalCadenceCompliancePct(),
+      totalCoinsEarned: this.wasm.sessionGetTotalCoins(),
 
       heartRateBpm: this.currentHrBpm,
       averageHeartRateBpm: avgHr,

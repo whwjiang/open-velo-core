@@ -9,7 +9,7 @@ interface WorkoutImporterModalProps {
   isOpen: boolean;
   onClose: () => void;
   ftpWatts: number;
-  onImportSuccess: (workout: StructuredWorkout) => void;
+  onImportSuccess: (workout: StructuredWorkout, persistToTxt?: boolean) => void;
 }
 
 const FORMAT_SAMPLES: Record<
@@ -142,6 +142,7 @@ export const WorkoutImporterModal: React.FC<WorkoutImporterModalProps> = ({
     useState<StructuredWorkout | null>(null);
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [persistToTxt, setPersistToTxt] = useState<boolean>(true);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Live preview compilation
@@ -221,7 +222,7 @@ export const WorkoutImporterModal: React.FC<WorkoutImporterModalProps> = ({
 
   const handleConfirmImport = () => {
     if (!livePreview.workout) return;
-    onImportSuccess(livePreview.workout);
+    onImportSuccess(livePreview.workout, persistToTxt);
     onClose();
   };
 
@@ -240,18 +241,28 @@ export const WorkoutImporterModal: React.FC<WorkoutImporterModalProps> = ({
               id="workout-import-title"
               className="text-base font-semibold text-slate-900 dark:text-slate-100"
             >
-              Universal Workout Importer &amp; Interval Compiler
+              Import or Create Workout
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Drop a workout file (<code className="font-mono">.ZWO</code>,{' '}
+              Drop a workout file (<code className="font-mono">.TXT</code>,{' '}
+              <code className="font-mono">.ZWO</code>,{' '}
               <code className="font-mono">.MRC</code>,{' '}
               <code className="font-mono">.ERG</code>,{' '}
               <code className="font-mono">.FIT</code>,{' '}
-              <code className="font-mono">.JSON</code>) or author intervals using Shorthand DSL scaled to your {ftpWatts} W FTP.
+              <code className="font-mono">.JSON</code>) or author intervals in plain text scaled to your {ftpWatts} W FTP.
             </p>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="flex items-center gap-1.5 text-xs text-slate-700 dark:text-slate-300 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={persistToTxt}
+                onChange={(e) => setPersistToTxt(e.target.checked)}
+                className="rounded border-slate-300 dark:border-slate-700 accent-cyan-600"
+              />
+              <span>Persist to workouts.txt</span>
+            </label>
             <button
               type="button"
               onClick={onClose}
@@ -265,7 +276,7 @@ export const WorkoutImporterModal: React.FC<WorkoutImporterModalProps> = ({
               onClick={handleConfirmImport}
               className="px-4 py-1.5 text-xs font-medium rounded-md bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 text-white transition-colors whitespace-nowrap shrink-0"
             >
-              Load into Cockpit &amp; Sync ERG
+              {persistToTxt ? 'Save to workouts.txt & Load' : 'Load into Cockpit'}
             </button>
           </div>
         </div>

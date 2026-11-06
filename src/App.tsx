@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
+import { Bug, Moon, Sun } from 'lucide-react';
 import { HardwareModal } from './components/HardwareModal';
 import { ProtocolInspector } from './components/ProtocolInspector';
-import { RustSdkView } from './components/RustSdkView';
 import { WorkoutCanvas } from './components/WorkoutCanvas';
 import { WorkoutImporterModal } from './components/WorkoutImporterModal';
 import { WorkoutLibraryView } from './components/WorkoutLibraryView';
@@ -14,9 +14,17 @@ import {
   TrainerControlMode,
 } from './sdk/types';
 import { veloCoreEngine } from './sdk/VeloCoreEngine';
-import { BUILTIN_WORKOUTS, encodeTelemetryToFitBinary } from './sdk/workouts';
+import {
+  BUILTIN_WORKOUTS,
+  downloadTextFile,
+  encodeTelemetryToFitBinary,
+  loadWorkoutsFromTxtFile,
+  saveRiderProfileToTxtFile,
+  saveWorkoutsToTxtFile,
+  serializeRiderProfileToTxt,
+} from './sdk/workouts';
 
-type ActiveWorkspaceTab = 'COCKPIT' | 'WORKOUTS' | 'PROTOCOL_LAB' | 'RUST_SDK';
+type ActiveWorkspaceTab = 'COCKPIT' | 'WORKOUTS' | 'PROTOCOL_LAB';
 
 function formatClock(sec: number): string {
   const m = Math.floor(sec / 60);
@@ -27,6 +35,7 @@ function formatClock(sec: number): string {
 export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveWorkspaceTab>('COCKPIT');
   const [isDark, setIsDark] = useState<boolean>(true);
+  const [isDebugMode, setIsDebugMode] = useState<boolean>(false);
   const [isHardwareModalOpen, setIsHardwareModalOpen] = useState<boolean>(false);
   const [isWorkoutImporterOpen, setIsWorkoutImporterOpen] =
     useState<boolean>(false);
@@ -38,6 +47,16 @@ export default function App() {
   const [snapshot, setSnapshot] = useState<TelemetrySnapshot>(
     veloCoreEngine.getSnapshot()
   );
+  const [ftpInput, setFtpInput] = useState<string>(
+    String(veloCoreEngine.getSnapshot().ftpWatts)
+  );
+  const [weightInput, setWeightInput] = useState<string>(
+    String(veloCoreEngine.getSnapshot().riderWeightKg)
+  );
+  const [isEditingFtp, setIsEditingFtp] = useState<boolean>(false);
+  const [isEditingWeight, setIsEditingWeight] = useState<boolean>(false);
+  const [riderSaveNotice, setRiderSaveNotice] = useState<string | null>(null);
+
   const [frames, setFrames] = useState<ProtocolFrameAudit[]>([]);
   const [devices, setDevices] = useState<ConnectedSensorDevice[]>([]);
   const [synthConfig, setSynthConfig] = useState<SyntheticGeneratorConfig>(
@@ -55,9 +74,19 @@ export default function App() {
     }
   }, [isDark]);
 
-  // Boot the Rust-to-WASM telemetry engine & subscribe to streams
+  // Boot the Rust-to-WASM telemetry engine, load workouts.txt, & subscribe to streams
   useEffect(() => {
-    veloCoreEngine.start();
+    void veloCoreEngine.start().then(async () => {
+      const snap = veloCoreEngine.getSnapshot();
+      setFtpInput(String(snap.ftpWatts));
+      setWeightInput(String(snap.riderWeightKg));
+      const loadedWorkouts = await loadWorkoutsFromTxtFile(snap.ftpWatts || 280);
+      if (loadedWorkouts.length > 0) {
+        setWorkouts(loadedWorkouts);
+        veloCoreEngine.selectWorkout(loadedWorkouts[0]);
+        setActiveWorkout(loadedWorkouts[0]);
+      }
+    });
 
     const unsubTel = veloCoreEngine.subscribeTelemetry((snap) => {
       setSnapshot({ ...snap });
@@ -77,17 +106,104 @@ export default function App() {
     };
   }, []);
 
+  // Keep string inputs in sync with engine snapshot when not actively typing
+  useEffect(() => {
+    if (!isEditingFtp) {
+      setFtpInput(String(snapshot.ftpWatts));
+    }
+  }, [snapshot.ftpWatts, isEditingFtp]);
+
+  useEffect(() => {
+    if (!isEditingWeight) {
+      setWeightInput(String(snapshot.riderWeightKg));
+    }
+  }, [snapshot.riderWeightKg, isEditingWeight]);
+
+  const handleToggleDebugMode = () => {
+    setIsDebugMode((prev) => {
+      const next = !prev;
+      if (!next) {
+        if (activeTab === 'PROTOCOL_LAB') {
+          setActiveTab('COCKPIT');
+        }
+        if (synthConfig.enabled) {
+          veloCoreEngine.updateSyntheticConfig({ enabled: false });
+          setSynthConfig(veloCoreEngine.getSyntheticConfig());
+        }
+      }
+      return next;
+    });
+  };
+
   const handleSelectWorkout = (workout: StructuredWorkout) => {
     veloCoreEngine.selectWorkout(workout);
     setActiveWorkout(workout);
     setActiveTab('COCKPIT');
   };
 
-  const handleAddCustomWorkout = (workout: StructuredWorkout) => {
-    setWorkouts((prev) => [workout, ...prev]);
+  const handleAddCustomWorkout = (
+    workout: StructuredWorkout,
+    persistToTxt: boolean = true
+  ) => {
+    setWorkouts((prev) => {
+      const filtered = prev.filter((w) => w.id !== workout.id);
+      const next = [workout, ...filtered];
+      if (persistToTxt) {
+        void saveWorkoutsToTxtFile(next);
+      }
+      return next;
+    });
     veloCoreEngine.selectWorkout(workout);
     setActiveWorkout(workout);
     setActiveTab('COCKPIT');
+  };
+
+  const handleReplaceWorkoutsLibrary = (
+    nextWorkouts: StructuredWorkout[],
+    persistToTxt: boolean = true
+  ) => {
+    if (nextWorkouts.length === 0) return;
+    setWorkouts(nextWorkouts);
+    if (persistToTxt) {
+      void saveWorkoutsToTxtFile(nextWorkouts);
+    }
+    veloCoreEngine.selectWorkout(nextWorkouts[0]);
+    setActiveWorkout(nextWorkouts[0]);
+  };
+
+  const handleFtpInputChange = (raw: string) => {
+    const cleaned = raw.replace(/[^0-9]/g, '');
+    setFtpInput(cleaned);
+    const numeric = cleaned === '' ? 0 : Number(cleaned);
+    veloCoreEngine.setRiderProfile(numeric, snapshot.riderWeightKg, true);
+  };
+
+  const handleWeightInputChange = (raw: string) => {
+    const cleaned = raw.replace(/[^0-9.]/g, '');
+    setWeightInput(cleaned);
+    const numeric = cleaned === '' || cleaned === '.' ? 0 : Number(cleaned);
+    if (Number.isFinite(numeric)) {
+      veloCoreEngine.setRiderProfile(snapshot.ftpWatts, numeric, true);
+    }
+  };
+
+  const handleZeroRiderMetrics = () => {
+    setFtpInput('0');
+    setWeightInput('0');
+    veloCoreEngine.setRiderProfile(0, 0, true);
+    setRiderSaveNotice('Zeroed & saved to rider-profile.txt');
+    window.setTimeout(() => setRiderSaveNotice(null), 2500);
+  };
+
+  const handleSaveRiderMetricsToTxt = async () => {
+    const ok = await saveRiderProfileToTxtFile({
+      ftpWatts: snapshot.ftpWatts,
+      weightKg: snapshot.riderWeightKg,
+    });
+    setRiderSaveNotice(
+      ok ? 'Saved to rider-profile.txt' : 'Saved to browser storage'
+    );
+    window.setTimeout(() => setRiderSaveNotice(null), 2500);
   };
 
   const handleUpdateSynth = (patch: Partial<SyntheticGeneratorConfig>) => {
@@ -96,23 +212,7 @@ export default function App() {
   };
 
   const handleQuickExportFit = () => {
-    const history = veloCoreEngine.getTelemetryHistory();
-    const pts =
-      history.length > 0
-        ? history
-        : [
-            {
-              elapsedSec: 1,
-              powerWatts: snapshot.instantPowerWatts,
-              power3sWatts: snapshot.power3sWatts,
-              targetWatts: snapshot.targetPowerWatts,
-              heartRateBpm: snapshot.heartRateBpm,
-              cadenceRpm: snapshot.cadenceRpm,
-              speedKph: snapshot.speedKph,
-              wPrimeBalancePct: snapshot.wPrimeBalancePct,
-            },
-          ];
-    const bytes = encodeTelemetryToFitBinary(pts);
+    const bytes = veloCoreEngine.encodeFitActivityBinary();
     const blob = new Blob([bytes.buffer as ArrayBuffer], {
       type: 'application/octet-stream',
     });
@@ -125,6 +225,9 @@ export default function App() {
   };
 
   const powerDelta = snapshot.power3sWatts - snapshot.targetPowerWatts;
+  const visibleDevices = isDebugMode
+    ? devices
+    : devices.filter((dev) => dev.status === 'CONNECTED');
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-[#07090E] text-slate-900 dark:text-slate-100 flex flex-col">
@@ -139,10 +242,10 @@ export default function App() {
           }}
           className="text-lg font-bold tracking-tight text-slate-900 dark:text-slate-100 whitespace-nowrap shrink-0"
         >
-          VeloCore WASM
+          {isDebugMode ? 'VeloCore WASM' : 'VeloCore'}
         </a>
 
-        {/* Zone 2: 4 concise single-line text navigation links */}
+        {/* Zone 2: Navigation links */}
         <nav className="flex items-center gap-6 text-sm font-medium text-slate-600 dark:text-slate-400">
           <a
             href="#cockpit"
@@ -172,43 +275,58 @@ export default function App() {
           >
             Workouts
           </a>
-          <a
-            href="#protocol-debug"
-            onClick={(e) => {
-              e.preventDefault();
-              setActiveTab('PROTOCOL_LAB');
-            }}
-            className={`transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 ${
-              activeTab === 'PROTOCOL_LAB'
-                ? 'text-slate-900 dark:text-white underline underline-offset-8 decoration-cyan-500 decoration-2'
-                : 'hover:text-slate-900 dark:hover:text-slate-200'
-            }`}
-          >
-            <span>Protocol &amp; Debug</span>
-            <span
-              className={`w-1.5 h-1.5 rounded-full ${
-                synthConfig.enabled ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
+          {isDebugMode && (
+            <a
+              href="#protocol-debug"
+              onClick={(e) => {
+                e.preventDefault();
+                setActiveTab('PROTOCOL_LAB');
+              }}
+              className={`transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 ${
+                activeTab === 'PROTOCOL_LAB'
+                  ? 'text-slate-900 dark:text-white underline underline-offset-8 decoration-cyan-500 decoration-2'
+                  : 'hover:text-slate-900 dark:hover:text-slate-200'
               }`}
-            />
-          </a>
-          <a
-            href="#rust-sdk"
-            onClick={(e) => {
-              e.preventDefault();
-              setActiveTab('RUST_SDK');
-            }}
-            className={`transition-colors whitespace-nowrap shrink-0 ${
-              activeTab === 'RUST_SDK'
-                ? 'text-slate-900 dark:text-white underline underline-offset-8 decoration-cyan-500 decoration-2'
-                : 'hover:text-slate-900 dark:hover:text-slate-200'
-            }`}
-          >
-            Rust SDK
-          </a>
+            >
+              <span>Protocol &amp; Debug</span>
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  synthConfig.enabled ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
+                }`}
+              />
+            </a>
+          )}
         </nav>
 
-        {/* Zone 3: 1 primary action */}
-        <div className="flex items-center shrink-0">
+        {/* Zone 3: Debug Toggle + Theme Toggle Icon + Connect Hardware Action */}
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={handleToggleDebugMode}
+            aria-label={isDebugMode ? 'Disable Debug Mode' : 'Enable Debug Mode'}
+            title={
+              isDebugMode
+                ? 'Debug Mode Active (click to hide protocol & synthetic tools)'
+                : 'Enable Debug & Synthetic Mode'
+            }
+            className={`p-2 rounded-lg border transition-colors shrink-0 flex items-center gap-1.5 text-xs font-medium ${
+              isDebugMode
+                ? 'border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                : 'border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
+            }`}
+          >
+            <Bug className="w-4 h-4" />
+            {isDebugMode && <span className="font-mono text-[11px]">DEBUG</span>}
+          </button>
+          <button
+            type="button"
+            onClick={() => setIsDark((d) => !d)}
+            aria-label={isDark ? 'Switch to light theme' : 'Switch to dark theme'}
+            title={isDark ? 'Switch to light theme' : 'Switch to dark theme'}
+            className="p-2 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors shrink-0"
+          >
+            {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+          </button>
           <button
             type="button"
             onClick={() => setIsHardwareModalOpen(true)}
@@ -241,22 +359,24 @@ export default function App() {
 
           {/* Playback, Import Workout & Workspace Actions */}
           <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setActiveTab('PROTOCOL_LAB')}
-              className={`px-2.5 py-1 text-xs font-mono font-medium rounded border transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 ${
-                synthConfig.enabled
-                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-                  : 'border-slate-300 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
-              }`}
-            >
-              <span
-                className={`w-1.5 h-1.5 rounded-full ${
-                  synthConfig.enabled ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
+            {isDebugMode && (
+              <button
+                type="button"
+                onClick={() => setActiveTab('PROTOCOL_LAB')}
+                className={`px-2.5 py-1 text-xs font-mono font-medium rounded border transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 ${
+                  synthConfig.enabled
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                    : 'border-slate-300 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
                 }`}
-              />
-              <span>Synth Wire: {synthConfig.enabled ? 'ON' : 'OFF'}</span>
-            </button>
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    synthConfig.enabled ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
+                  }`}
+                />
+                <span>Synth Wire: {synthConfig.enabled ? 'ON' : 'OFF'}</span>
+              </button>
+            )}
 
             <button
               type="button"
@@ -275,7 +395,11 @@ export default function App() {
                   : 'bg-emerald-600 text-white hover:bg-emerald-500'
               }`}
             >
-              {isRiding ? 'Pause Ride' : 'Resume Ride'}
+              {isRiding
+                ? 'Pause Ride'
+                : snapshot.elapsedSec === 0
+                  ? 'Start Ride'
+                  : 'Resume Ride'}
             </button>
 
             <button
@@ -313,58 +437,104 @@ export default function App() {
             >
               Export .FIT
             </button>
-
-            <button
-              type="button"
-              onClick={() => setIsDark((d) => !d)}
-              className="px-2.5 py-1 text-xs font-medium border border-slate-300 dark:border-slate-700 rounded hover:bg-white dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition-colors whitespace-nowrap shrink-0"
-            >
-              {isDark ? 'Light Theme' : 'Dark Theme'}
-            </button>
           </div>
         </div>
       </div>
 
       {/* Main Content Container (1440px Desktop Baseline) */}
       <main className="flex-1 max-w-[1440px] w-full mx-auto px-6 py-5 space-y-5">
-        {/* Top Precision Telemetry Ribbon (6-Column Tabular Instrument Grid) */}
+        {/* Top Precision Telemetry Ribbon (Front-and-Center 9-Tile Instrument Grid) */}
         <section
           aria-label="Live Telemetry Ribbon"
-          className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/90 rounded-lg divide-y md:divide-y-0 md:divide-x divide-slate-200 dark:divide-slate-800"
+          className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-9 border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/90 rounded-lg divide-y lg:divide-y-0 sm:divide-x divide-slate-200 dark:divide-slate-800"
         >
           {/* 1. 3s Smoothed Power */}
-          <div className="p-4">
-            <div className="text-xs text-slate-500 dark:text-slate-400">
-              Power (3s Rolling)
+          <div className="p-3.5">
+            <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+              3s Power
             </div>
             <div className="mt-1 flex items-baseline">
-              <span className="text-3xl font-mono font-bold tabular-nums text-cyan-600 dark:text-cyan-400">
+              <span className="text-2xl xl:text-3xl font-mono font-bold tabular-nums text-cyan-600 dark:text-cyan-400">
                 {snapshot.power3sWatts}
               </span>
-              <span className="text-xs uppercase font-mono text-slate-400 ml-1.5">
+              <span className="text-xs uppercase font-mono text-slate-400 ml-1">
                 W
               </span>
             </div>
-            <div className="mt-1 text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400">
+            <div className="mt-1 text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400 truncate">
               {snapshot.wattsPerKg.toFixed(2)} W/kg · NP {snapshot.normalizedPowerWatts}W
             </div>
           </div>
 
-          {/* 2. Smart Trainer Target */}
-          <div className="p-4">
-            <div className="text-xs text-slate-500 dark:text-slate-400">
-              Trainer Target ({snapshot.trainerMode})
+          {/* 2. Instant Power */}
+          <div className="p-3.5">
+            <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+              Instant Power
             </div>
             <div className="mt-1 flex items-baseline">
-              <span className="text-3xl font-mono font-bold tabular-nums text-slate-900 dark:text-slate-100">
+              <span className="text-2xl xl:text-3xl font-mono font-bold tabular-nums text-slate-900 dark:text-slate-100">
+                {snapshot.instantPowerWatts}
+              </span>
+              <span className="text-xs uppercase font-mono text-slate-400 ml-1">
+                W
+              </span>
+            </div>
+            <div className="mt-1 text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400 truncate">
+              10s {snapshot.power10sWatts}W · 30s {snapshot.power30sWatts}W
+            </div>
+          </div>
+
+          {/* 3. Interval Power */}
+          <div className="p-3.5">
+            <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+              Interval Power
+            </div>
+            <div className="mt-1 flex items-baseline">
+              <span className="text-2xl xl:text-3xl font-mono font-bold tabular-nums text-emerald-600 dark:text-emerald-400">
+                {snapshot.intervalPowerWatts}
+              </span>
+              <span className="text-xs uppercase font-mono text-slate-400 ml-1">
+                W
+              </span>
+            </div>
+            <div className="mt-1 text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400 truncate">
+              Step {snapshot.activeIntervalIndex + 1} · {formatClock(snapshot.intervalElapsedSec)}
+            </div>
+          </div>
+
+          {/* 4. Max Power */}
+          <div className="p-3.5">
+            <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+              Max Power
+            </div>
+            <div className="mt-1 flex items-baseline">
+              <span className="text-2xl xl:text-3xl font-mono font-bold tabular-nums text-amber-600 dark:text-amber-400">
+                {snapshot.maxPowerWatts}
+              </span>
+              <span className="text-xs uppercase font-mono text-slate-400 ml-1">
+                W
+              </span>
+            </div>
+            <div className="mt-1 text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400 truncate">
+              Avg {snapshot.averagePowerWatts}W · {(snapshot.maxPowerWatts / Math.max(40, snapshot.riderWeightKg)).toFixed(1)} W/kg
+            </div>
+          </div>
+
+          {/* 5. Smart Trainer Target */}
+          <div className="p-3.5">
+            <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+              Target ({snapshot.trainerMode})
+            </div>
+            <div className="mt-1 flex items-baseline">
+              <span className="text-2xl xl:text-3xl font-mono font-bold tabular-nums text-slate-900 dark:text-slate-100">
                 {snapshot.targetPowerWatts}
               </span>
-              <span className="text-xs uppercase font-mono text-slate-400 ml-1.5">
+              <span className="text-xs uppercase font-mono text-slate-400 ml-1">
                 W
               </span>
             </div>
             <div
-              className={`mt-1 text-xs font-mono tabular-nums ${
+              className={`mt-1 text-[11px] font-mono tabular-nums truncate ${
                 Math.abs(powerDelta) <= 12
                   ? 'text-emerald-600 dark:text-emerald-400'
                   : powerDelta > 12
@@ -372,82 +542,79 @@ export default function App() {
                     : 'text-cyan-600 dark:text-cyan-400'
               }`}
             >
-              Delta: {powerDelta >= 0 ? `+${powerDelta}` : powerDelta} W · Bias{' '}
-              {snapshot.intensityBiasPct}%
+              {powerDelta >= 0 ? `+${powerDelta}` : powerDelta} W · Bias {snapshot.intensityBiasPct}%
             </div>
           </div>
 
-          {/* 3. Heart Rate */}
-          <div className="p-4">
-            <div className="text-xs text-slate-500 dark:text-slate-400">
-              Heart Rate (ANT+ / BLE)
+          {/* 6. Heart Rate */}
+          <div className="p-3.5">
+            <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+              Heart Rate
             </div>
             <div className="mt-1 flex items-baseline">
-              <span className="text-3xl font-mono font-bold tabular-nums text-rose-600 dark:text-rose-400">
+              <span className="text-2xl xl:text-3xl font-mono font-bold tabular-nums text-rose-600 dark:text-rose-400">
                 {snapshot.heartRateBpm}
               </span>
-              <span className="text-xs uppercase font-mono text-slate-400 ml-1.5">
+              <span className="text-xs uppercase font-mono text-slate-400 ml-1">
                 BPM
               </span>
             </div>
-            <div className="mt-1 text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400">
-              Avg {snapshot.averageHeartRateBpm} · Max {snapshot.maxHeartRateBpm} BPM
+            <div className="mt-1 text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400 truncate">
+              Avg {snapshot.averageHeartRateBpm} · Max {snapshot.maxHeartRateBpm}
             </div>
           </div>
 
-          {/* 4. Cadence & Pedal Balance */}
-          <div className="p-4">
-            <div className="text-xs text-slate-500 dark:text-slate-400">
-              Crank Cadence
+          {/* 7. Cadence & Pedal Balance */}
+          <div className="p-3.5">
+            <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+              Cadence
             </div>
             <div className="mt-1 flex items-baseline">
-              <span className="text-3xl font-mono font-bold tabular-nums text-emerald-600 dark:text-emerald-400">
+              <span className="text-2xl xl:text-3xl font-mono font-bold tabular-nums text-emerald-600 dark:text-emerald-400">
                 {snapshot.cadenceRpm}
               </span>
-              <span className="text-xs uppercase font-mono text-slate-400 ml-1.5">
+              <span className="text-xs uppercase font-mono text-slate-400 ml-1">
                 RPM
               </span>
             </div>
-            <div className="mt-1 text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400">
-              L/R {snapshot.leftRightBalancePct}/
-              {100 - snapshot.leftRightBalancePct}% · Avg {snapshot.averageCadenceRpm}
+            <div className="mt-1 text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400 truncate">
+              {snapshot.leftRightBalancePct}/{100 - snapshot.leftRightBalancePct}% · Avg {snapshot.averageCadenceRpm}
             </div>
           </div>
 
-          {/* 5. Virtual Speed & Work */}
-          <div className="p-4">
-            <div className="text-xs text-slate-500 dark:text-slate-400">
-              FE-C Speed &amp; Work
+          {/* 8. Virtual Speed & Work */}
+          <div className="p-3.5">
+            <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+              Speed &amp; Work
             </div>
             <div className="mt-1 flex items-baseline">
-              <span className="text-3xl font-mono font-bold tabular-nums text-slate-900 dark:text-slate-100">
+              <span className="text-2xl xl:text-3xl font-mono font-bold tabular-nums text-slate-900 dark:text-slate-100">
                 {snapshot.speedKph.toFixed(1)}
               </span>
-              <span className="text-xs uppercase font-mono text-slate-400 ml-1.5">
+              <span className="text-xs uppercase font-mono text-slate-400 ml-1">
                 km/h
               </span>
             </div>
-            <div className="mt-1 text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400">
+            <div className="mt-1 text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400 truncate">
               {(snapshot.distanceMeters / 1000).toFixed(2)} km · {snapshot.kilojoules} kJ
             </div>
           </div>
 
-          {/* 6. Anaerobic W'bal Reserve */}
-          <div className="p-4">
-            <div className="text-xs text-slate-500 dark:text-slate-400">
-              W&apos;bal Reserve (Skiba)
+          {/* 9. Anaerobic W'bal Reserve */}
+          <div className="p-3.5">
+            <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+              W&apos;bal Reserve
             </div>
             <div className="mt-1 flex items-baseline">
-              <span className="text-3xl font-mono font-bold tabular-nums text-amber-600 dark:text-amber-400">
+              <span className="text-2xl xl:text-3xl font-mono font-bold tabular-nums text-amber-600 dark:text-amber-400">
                 {snapshot.wPrimeBalancePct.toFixed(0)}
               </span>
-              <span className="text-xs uppercase font-mono text-slate-400 ml-1.5">
+              <span className="text-xs uppercase font-mono text-slate-400 ml-1">
                 %
               </span>
             </div>
-            <div className="mt-1 text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400">
-              {(snapshot.wPrimeBalanceJoules / 1000).toFixed(1)} kJ · IF{' '}
-              {snapshot.intensityFactor.toFixed(2)}
+            <div className="mt-1 text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400 truncate">
+              {(snapshot.wPrimeBalanceJoules / 1000).toFixed(1)} kJ · IF {snapshot.intensityFactor.toFixed(2)}
             </div>
           </div>
         </section>
@@ -500,10 +667,12 @@ export default function App() {
               <div className="border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/90 rounded-lg p-4 space-y-4">
                 <div>
                   <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                    Smart Trainer Control (FE-C / FTMS)
+                    Smart Trainer Control
                   </h2>
                   <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                    Encodes ANT+ FE-C Pages 48/49/51 &amp; BLE 0x2AD9 frames via Rust WASM.
+                    {isDebugMode
+                      ? 'Encodes ANT+ FE-C Pages 48/49/51 & BLE 0x2AD9 frames via Rust WASM.'
+                      : 'Adjust ERG target power, simulated road grade, or linear brake resistance.'}
                   </p>
                 </div>
 
@@ -584,7 +753,7 @@ export default function App() {
                   <div className="space-y-3 pt-1">
                     <div className="flex items-center justify-between text-xs">
                       <span className="text-slate-600 dark:text-slate-400">
-                        Simulated Road Grade (FE-C Page 51)
+                        Simulated Road Grade
                       </span>
                       <span className="font-mono font-semibold tabular-nums text-slate-900 dark:text-slate-100">
                         {snapshot.targetSlopePct >= 0
@@ -634,7 +803,7 @@ export default function App() {
                   <div className="space-y-3 pt-1">
                     <div className="flex items-center justify-between text-xs">
                       <span className="text-slate-600 dark:text-slate-400">
-                        Linear Brake Resistance (FE-C Page 48)
+                        Linear Brake Resistance
                       </span>
                       <span className="font-mono font-semibold tabular-nums text-slate-900 dark:text-slate-100">
                         {snapshot.targetResistancePct}%
@@ -680,165 +849,231 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Rider FTP & Mass Calibration */}
-                <div className="pt-3 border-t border-slate-200 dark:border-slate-800 grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">
-                      Rider FTP (Watts)
-                    </label>
-                    <input
-                      type="number"
-                      min={100}
-                      max={550}
-                      value={snapshot.ftpWatts}
-                      onChange={(e) =>
-                        veloCoreEngine.setRiderProfile(
-                          Number(e.target.value),
-                          snapshot.riderWeightKg
-                        )
-                      }
-                      className="w-full px-2.5 py-1.5 text-xs font-mono tabular-nums bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded text-slate-900 dark:text-slate-100"
-                    />
+                {/* Rider FTP & Mass Calibration (Saved to rider-profile.txt) */}
+                <div className="pt-3 border-t border-slate-200 dark:border-slate-800 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium text-slate-700 dark:text-slate-300">
+                      Rider Metrics (<code className="font-mono text-[11px]">rider-profile.txt</code>)
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleZeroRiderMetrics}
+                        className="text-[11px] font-medium text-slate-500 dark:text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 transition-colors"
+                        title="Zero out FTP and Mass"
+                      >
+                        Zero
+                      </button>
+                      <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">·</span>
+                      <button
+                        type="button"
+                        onClick={handleSaveRiderMetricsToTxt}
+                        className="text-[11px] font-medium text-cyan-600 dark:text-cyan-400 hover:underline"
+                      >
+                        Save
+                      </button>
+                      <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">·</span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          downloadTextFile(
+                            'rider-profile.txt',
+                            serializeRiderProfileToTxt({
+                              ftpWatts: snapshot.ftpWatts,
+                              weightKg: snapshot.riderWeightKg,
+                            })
+                          )
+                        }
+                        className="text-[11px] font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
+                        title="Download rider-profile.txt"
+                      >
+                        Export .txt
+                      </button>
+                    </div>
                   </div>
-                  <div>
-                    <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">
-                      Rider Mass (kg)
-                    </label>
-                    <input
-                      type="number"
-                      min={40}
-                      max={140}
-                      step={0.5}
-                      value={snapshot.riderWeightKg}
-                      onChange={(e) =>
-                        veloCoreEngine.setRiderProfile(
-                          snapshot.ftpWatts,
-                          Number(e.target.value)
-                        )
-                      }
-                      className="w-full px-2.5 py-1.5 text-xs font-mono tabular-nums bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded text-slate-900 dark:text-slate-100"
-                    />
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">
+                        Rider FTP (Watts)
+                      </label>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        placeholder="0"
+                        value={ftpInput}
+                        onFocus={() => setIsEditingFtp(true)}
+                        onBlur={() => {
+                          setIsEditingFtp(false);
+                          const numeric = ftpInput.trim() === '' ? 0 : Number(ftpInput);
+                          const safe = Number.isFinite(numeric) ? Math.max(0, Math.round(numeric)) : 0;
+                          setFtpInput(String(safe));
+                          veloCoreEngine.setRiderProfile(safe, snapshot.riderWeightKg, true);
+                        }}
+                        onChange={(e) => handleFtpInputChange(e.target.value)}
+                        className="w-full px-2.5 py-1.5 text-xs font-mono tabular-nums bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded text-slate-900 dark:text-slate-100 focus:outline-none focus:border-cyan-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">
+                        Rider Mass (kg)
+                      </label>
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        placeholder="0"
+                        value={weightInput}
+                        onFocus={() => setIsEditingWeight(true)}
+                        onBlur={() => {
+                          setIsEditingWeight(false);
+                          const numeric =
+                            weightInput.trim() === '' || weightInput.trim() === '.'
+                              ? 0
+                              : Number(weightInput);
+                          const safe = Number.isFinite(numeric)
+                            ? Math.max(0, Number(numeric.toFixed(1)))
+                            : 0;
+                          setWeightInput(String(safe));
+                          veloCoreEngine.setRiderProfile(snapshot.ftpWatts, safe, true);
+                        }}
+                        onChange={(e) => handleWeightInputChange(e.target.value)}
+                        className="w-full px-2.5 py-1.5 text-xs font-mono tabular-nums bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded text-slate-900 dark:text-slate-100 focus:outline-none focus:border-cyan-500"
+                      />
+                    </div>
                   </div>
+
+                  {riderSaveNotice && (
+                    <div className="text-[11px] font-mono text-emerald-600 dark:text-emerald-400">
+                      {riderSaveNotice}
+                    </div>
+                  )}
                 </div>
               </div>
 
-              {/* Active Hardware Channels & Synthetic Wire Stress Controls */}
+              {/* Connected Sensors & (Debug-Only) Synthetic Wire Controls */}
               <div className="border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/90 rounded-lg p-4 space-y-3.5">
                 <div className="flex items-center justify-between gap-2">
                   <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                    Active Sensor Channels
+                    Connected Sensors
                   </h2>
                   <button
                     type="button"
                     onClick={() => setIsHardwareModalOpen(true)}
                     className="text-xs font-medium text-cyan-600 dark:text-cyan-400 hover:underline whitespace-nowrap shrink-0"
                   >
-                    Configure USB / BLE
+                    Pair USB / BLE
                   </button>
                 </div>
 
-                <div className="divide-y divide-slate-200 dark:divide-slate-800 border border-slate-200 dark:border-slate-800 rounded-md">
-                  {devices.map((dev) => (
-                    <div
-                      key={dev.id}
-                      className="px-3 py-2.5 flex items-center justify-between gap-2 text-xs"
+                {visibleDevices.length === 0 ? (
+                  <div className="border border-dashed border-slate-300 dark:border-slate-800 rounded-md p-3.5 text-center space-y-2">
+                    <div className="text-xs text-slate-500 dark:text-slate-400">
+                      No sensors paired yet. Connect your ANT+ USB stick or Bluetooth trainer to stream live telemetry.
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setIsHardwareModalOpen(true)}
+                      className="px-3 py-1 text-xs font-medium text-cyan-600 dark:text-cyan-400 border border-cyan-500/40 hover:bg-cyan-500/10 rounded transition-colors"
                     >
-                      <div className="min-w-0">
-                        <div className="font-medium text-slate-900 dark:text-slate-100 truncate">
-                          {dev.name}
+                      Pair Trainer / Sensors
+                    </button>
+                  </div>
+                ) : (
+                  <div className="divide-y divide-slate-200 dark:divide-slate-800 border border-slate-200 dark:border-slate-800 rounded-md">
+                    {visibleDevices.map((dev) => (
+                      <div
+                        key={dev.id}
+                        className="px-3 py-2.5 flex items-center justify-between gap-2 text-xs"
+                      >
+                        <div className="min-w-0">
+                          <div className="font-medium text-slate-900 dark:text-slate-100 truncate">
+                            {dev.name}
+                          </div>
+                          <div className="text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400">
+                            {dev.channelOrUuid}
+                          </div>
                         </div>
-                        <div className="text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400">
-                          {dev.channelOrUuid}
+                        <div className="text-right font-mono tabular-nums shrink-0">
+                          <div
+                            className={
+                              dev.status === 'CONNECTED'
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : 'text-cyan-600 dark:text-cyan-400'
+                            }
+                          >
+                            {dev.status === 'CONNECTED' ? '● Connected' : '● Synth'}
+                          </div>
+                          <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                            {dev.packetCount} pkts
+                          </div>
                         </div>
                       </div>
-                      <div className="text-right font-mono tabular-nums shrink-0">
-                        <div
-                          className={
-                            dev.status === 'CONNECTED'
-                              ? 'text-emerald-600 dark:text-emerald-400'
-                              : 'text-cyan-600 dark:text-cyan-400'
-                          }
-                        >
-                          {dev.status === 'CONNECTED' ? '● USB/BLE' : '● Synth'}
-                        </div>
-                        <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                          {dev.packetCount} pkts
-                        </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Quick Synthetic Wire Generator Rate & Effort Offset (Debug Mode Only) */}
+                {isDebugMode && (
+                  <div className="pt-2 border-t border-slate-200 dark:border-slate-800 space-y-2.5">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-600 dark:text-slate-400">
+                        Synthetic Wire Stream
+                      </span>
+                      <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-0.5 rounded font-mono">
+                        {([4, 8, 16] as const).map((hz) => (
+                          <button
+                            key={hz}
+                            type="button"
+                            onClick={() => handleUpdateSynth({ frequencyHz: hz })}
+                            className={`px-2 py-0.5 text-[11px] rounded transition-colors ${
+                              synthConfig.frequencyHz === hz
+                                ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100'
+                                : 'text-slate-500 dark:text-slate-400'
+                            }`}
+                          >
+                            {hz}Hz
+                          </button>
+                        ))}
                       </div>
                     </div>
-                  ))}
-                </div>
 
-                {/* Quick Synthetic Wire Generator Rate & Effort Offset */}
-                <div className="pt-2 border-t border-slate-200 dark:border-slate-800 space-y-2.5">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="text-slate-600 dark:text-slate-400">
-                      Synthetic Wire Stream
-                    </span>
-                    <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-0.5 rounded font-mono">
-                      {([4, 8, 16] as const).map((hz) => (
-                        <button
-                          key={hz}
-                          type="button"
-                          onClick={() => handleUpdateSynth({ frequencyHz: hz })}
-                          className={`px-2 py-0.5 text-[11px] rounded transition-colors ${
-                            synthConfig.frequencyHz === hz
-                              ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100'
-                              : 'text-slate-500 dark:text-slate-400'
-                          }`}
-                        >
-                          {hz}Hz
-                        </button>
-                      ))}
+                    <div>
+                      <div className="flex items-center justify-between text-xs mb-1">
+                        <span className="text-slate-500 dark:text-slate-400">
+                          Simulated Rider Surge / Fade
+                        </span>
+                        <span className="font-mono tabular-nums text-slate-700 dark:text-slate-300">
+                          {synthConfig.baseRiderEffortOffsetWatts >= 0
+                            ? `+${synthConfig.baseRiderEffortOffsetWatts} W`
+                            : `${synthConfig.baseRiderEffortOffsetWatts} W`}
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={-50}
+                        max={50}
+                        step={5}
+                        value={synthConfig.baseRiderEffortOffsetWatts}
+                        onChange={(e) =>
+                          handleUpdateSynth({
+                            baseRiderEffortOffsetWatts: Number(e.target.value),
+                          })
+                        }
+                        className="w-full accent-cyan-500"
+                      />
                     </div>
                   </div>
-
-                  <div>
-                    <div className="flex items-center justify-between text-xs mb-1">
-                      <span className="text-slate-500 dark:text-slate-400">
-                        Simulated Rider Surge / Fade
-                      </span>
-                      <span className="font-mono tabular-nums text-slate-700 dark:text-slate-300">
-                        {synthConfig.baseRiderEffortOffsetWatts >= 0
-                          ? `+${synthConfig.baseRiderEffortOffsetWatts} W`
-                          : `${synthConfig.baseRiderEffortOffsetWatts} W`}
-                      </span>
-                    </div>
-                    <input
-                      type="range"
-                      min={-50}
-                      max={50}
-                      step={5}
-                      value={synthConfig.baseRiderEffortOffsetWatts}
-                      onChange={(e) =>
-                        handleUpdateSynth({
-                          baseRiderEffortOffsetWatts: Number(e.target.value),
-                        })
-                      }
-                      className="w-full accent-cyan-500"
-                    />
-                  </div>
-                </div>
+                )}
               </div>
             </aside>
 
-            {/* Right Main Viewport Stage (8 cols): Workout Canvas + Protocol Inspector */}
+            {/* Right Main Viewport Stage (8 cols): Workout Canvas */}
             <div className="lg:col-span-8 space-y-5">
               <WorkoutCanvas
                 workout={activeWorkout}
                 snapshot={snapshot}
                 history={veloCoreEngine.getTelemetryHistory()}
                 onSelectSegment={(idx) => veloCoreEngine.skipToSegment(idx)}
-              />
-
-              <ProtocolInspector
-                frames={frames}
-                snapshot={snapshot}
-                synthConfig={synthConfig}
-                onUpdateSynth={handleUpdateSynth}
-                onInjectHexFrame={(hex, proto) =>
-                  veloCoreEngine.injectRawHexFrame(hex, proto)
-                }
               />
             </div>
           </div>
@@ -852,11 +1087,13 @@ export default function App() {
             history={veloCoreEngine.getTelemetryHistory()}
             onSelectWorkout={handleSelectWorkout}
             onAddCustomWorkout={handleAddCustomWorkout}
+            onReplaceWorkoutsLibrary={handleReplaceWorkoutsLibrary}
+            onSaveLibraryToTxt={() => saveWorkoutsToTxtFile(workouts)}
             onOpenImporterModal={() => setIsWorkoutImporterOpen(true)}
           />
         )}
 
-        {activeTab === 'PROTOCOL_LAB' && (
+        {activeTab === 'PROTOCOL_LAB' && isDebugMode && (
           <div className="space-y-5">
             <ProtocolInspector
               frames={frames}
@@ -869,8 +1106,6 @@ export default function App() {
             />
           </div>
         )}
-
-        {activeTab === 'RUST_SDK' && <RustSdkView />}
       </main>
 
       {/* Universal Workout Importer & Interval Builder Modal */}
@@ -887,6 +1122,7 @@ export default function App() {
         onClose={() => setIsHardwareModalOpen(false)}
         devices={devices}
         synthConfig={synthConfig}
+        isDebugMode={isDebugMode}
         onUpdateSynth={handleUpdateSynth}
         onConnectAntUsb={() => veloCoreEngine.connectWebUsbAntDongle()}
         onConnectBle={(role) => veloCoreEngine.connectWebBluetoothSensor(role)}

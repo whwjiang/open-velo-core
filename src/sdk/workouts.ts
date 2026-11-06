@@ -729,13 +729,15 @@ export function parseShorthandWorkout(
 
     if (durationSec < 5) return null;
 
-    // Match power: e.g. "50-75%", "95%", "260w", "200-300w"
+    // Match power: e.g. "50-75%", "50%->75%", "95%", "260w", "200-300w"
     let startPct = 0.75;
     let endPct: number | undefined;
 
-    const pctRangeMatch = remaining.match(/\b(\d+(?:\.\d+)?)\s*(?:-|to|→)\s*(\d+(?:\.\d+)?)%/i);
+    const pctRangeMatch = remaining.match(
+      /\b(\d+(?:\.\d+)?)%?\s*(?:-|to|->|→)\s*(\d+(?:\.\d+)?)%/i
+    );
     const pctSingleMatch = remaining.match(/\b(\d+(?:\.\d+)?)%/);
-    const wattRangeMatch = remaining.match(/\b(\d+)\s*(?:-|to|→)\s*(\d+)\s*w(?:atts)?\b/i);
+    const wattRangeMatch = remaining.match(/\b(\d+)\s*(?:-|to|->|→)\s*(\d+)\s*w(?:atts)?\b/i);
     const wattSingleMatch = remaining.match(/\b(\d+)\s*w(?:atts)?\b/i);
 
     if (pctRangeMatch) {
@@ -746,11 +748,11 @@ export function parseShorthandWorkout(
       startPct = Number(pctSingleMatch[1]) / 100;
       remaining = remaining.replace(pctSingleMatch[0], '').trim();
     } else if (wattRangeMatch) {
-      startPct = Number(wattRangeMatch[1]) / Math.max(100, userFtpWatts);
-      endPct = Number(wattRangeMatch[2]) / Math.max(100, userFtpWatts);
+      startPct = Number(wattRangeMatch[1]) / Math.max(100, userFtpWatts || 280);
+      endPct = Number(wattRangeMatch[2]) / Math.max(100, userFtpWatts || 280);
       remaining = remaining.replace(wattRangeMatch[0], '').trim();
     } else if (wattSingleMatch) {
-      startPct = Number(wattSingleMatch[1]) / Math.max(100, userFtpWatts);
+      startPct = Number(wattSingleMatch[1]) / Math.max(100, userFtpWatts || 280);
       remaining = remaining.replace(wattSingleMatch[0], '').trim();
     }
 
@@ -762,7 +764,7 @@ export function parseShorthandWorkout(
       remaining = remaining.replace(cadMatch[0], '').trim();
     }
 
-    const cleanLabel = remaining.replace(/^[@·-]\s*/, '').trim();
+    const cleanLabel = remaining.replace(/^[@·-]+\s*/, '').trim();
     return {
       durationSec,
       startPct: Number(Math.max(0.25, Math.min(2.5, startPct)).toFixed(3)),
@@ -774,6 +776,10 @@ export function parseShorthandWorkout(
       label: cleanLabel,
     };
   };
+
+  let customId = '';
+  let customAuthor = 'VeloCore Shorthand Compiler';
+  let customCategory: StructuredWorkout['category'] = 'Custom Import';
 
   const segments: WorkoutIntervalSegment[] = [];
   let currentRepeatCount = 1;
@@ -792,19 +798,28 @@ export function parseShorthandWorkout(
             ? `Ramp (${Math.round(item.startPct * 100)}% → ${Math.round(item.endPct * 100)}%)`
             : `${Math.round(item.startPct * 100)}% FTP`;
 
+        let stepName = item.label || defaultName;
+        let stepCue =
+          item.label ||
+          `Target ${Math.round(avgPct * 100)}% FTP (${Math.round(avgPct * (userFtpWatts || 280))} W)${
+            item.cadenceRpm ? ` at ${item.cadenceRpm} RPM` : ''
+          }.`;
+
+        if (item.label.includes('|')) {
+          const [rawName, ...rawCueParts] = item.label.split('|');
+          stepName = rawName.trim() || defaultName;
+          stepCue = rawCueParts.join('|').trim() || stepName;
+        }
+
         segments.push({
-          id: `short-${idx}`,
-          name: `${repPrefix}${item.label || defaultName}`,
+          id: `${customId || 'short'}-${idx}`,
+          name: `${repPrefix}${stepName}`,
           durationSec: item.durationSec,
           targetFtpPct: item.startPct,
           endTargetFtpPct: item.endPct,
           targetCadenceRpm: item.cadenceRpm,
           zoneLabel: classifyZone(avgPct),
-          coachCue:
-            item.label ||
-            `Target ${Math.round(avgPct * 100)}% FTP (${Math.round(avgPct * userFtpWatts)} W)${
-              item.cadenceRpm ? ` at ${item.cadenceRpm} RPM` : ''
-            }.`,
+          coachCue: stepCue,
         });
       }
     }
@@ -814,17 +829,42 @@ export function parseShorthandWorkout(
 
   for (const raw of rawLines) {
     const line = raw.trim();
-    if (!line) {
+    if (!line || line.startsWith('#')) {
       flushRepeatBuffer();
       continue;
     }
 
-    if (/^title\s*:/i.test(line)) {
-      title = line.replace(/^title\s*:/i, '').trim() || title;
+    if (/^@?id\s*:/i.test(line)) {
+      customId = line.replace(/^@?id\s*:/i, '').trim();
       continue;
     }
-    if (/^description\s*:/i.test(line)) {
-      description = line.replace(/^description\s*:/i, '').trim() || description;
+    if (/^(@?name|title)\s*:/i.test(line)) {
+      title = line.replace(/^(@?name|title)\s*:/i, '').trim() || title;
+      continue;
+    }
+    if (/^@?author\s*:/i.test(line)) {
+      customAuthor = line.replace(/^@?author\s*:/i, '').trim() || customAuthor;
+      continue;
+    }
+    if (/^@?category\s*:/i.test(line)) {
+      const rawCat = line.replace(/^@?category\s*:/i, '').trim().toUpperCase();
+      if (rawCat === 'THRESHOLD') {
+        customCategory = 'Threshold';
+      } else if (rawCat === 'VO2MAX') {
+        customCategory = 'VO2max';
+      } else if (rawCat === 'SWEET SPOT' || rawCat === 'SWEETSPOT') {
+        customCategory = 'Sweet Spot';
+      } else if (rawCat === 'ANAEROBIC') {
+        customCategory = 'Anaerobic';
+      } else if (rawCat === 'ENDURANCE') {
+        customCategory = 'Endurance';
+      } else {
+        customCategory = 'Custom Import';
+      }
+      continue;
+    }
+    if (/^@?description\s*:/i.test(line)) {
+      description = line.replace(/^@?description\s*:/i, '').trim() || description;
       continue;
     }
 
@@ -855,11 +895,11 @@ export function parseShorthandWorkout(
 
   const stats = computeWorkoutMetrics(segments);
   return {
-    id: `short-${Date.now()}`,
+    id: customId || `short-${Date.now()}`,
     title,
-    category: 'Custom Import',
+    category: customCategory,
     description,
-    author: 'VeloCore Shorthand Compiler',
+    author: customAuthor,
     ...stats,
     segments,
   };
@@ -1108,73 +1148,343 @@ function computeFitCrc16(bytes: Uint8Array, length: number): number {
 }
 
 /**
- * Encodes recorded telemetry history into a genuine binary Garmin `.FIT` activity file
- * with a valid 14-byte `.FIT` header, Record definition/data messages, and 16-bit CRC trailer.
+ * Encodes recorded telemetry history into a complete, standards-compliant Garmin `.FIT`
+ * Activity file (including `file_id`, `device_info`, `event`, `record`, `lap`, `session`,
+ * and `activity` messages + 14-byte header CRC + 16-bit trailer CRC) accepted by
+ * Garmin Connect, Strava, TrainingPeaks, Intervals.icu, and GoldenCheetah.
  */
 export function encodeTelemetryToFitBinary(history: TelemetryHistoryPoint[]): Uint8Array {
-  const defMsg = [
-    0x40,
-    0x00,
-    0x00,
-    0x14,
-    0x00,
-    0x05,
-    253, 4, 0x86,
-    7, 2, 0x84,
-    3, 1, 0x02,
-    4, 1, 0x02,
-    6, 2, 0x84,
+  const FIT_EPOCH_SEC = 631065600; // Seconds between 1970-01-01T00:00:00Z and 1989-12-31T00:00:00Z
+  const u16 = (v: number): [number, number] => [v & 0xff, (v >>> 8) & 0xff];
+  const u32 = (v: number): [number, number, number, number] => [
+    v & 0xff,
+    (v >>> 8) & 0xff,
+    (v >>> 16) & 0xff,
+    (v >>> 24) & 0xff,
   ];
 
-  const fitEpochOffset = Math.floor(Date.now() / 1000) - 631065600 - history.length;
-  const recordBytes: number[] = [...defMsg];
+  // Ensure at least 2 trackpoints so start_time < end_time and total_elapsed_time >= 1s
+  const nowMs = Date.now();
+  const pts: TelemetryHistoryPoint[] =
+    history.length >= 2
+      ? history
+      : history.length === 1
+        ? [
+            { ...history[0], timestampMs: (history[0].timestampMs ?? nowMs) - 1000, elapsedSec: 0 },
+            { ...history[0], timestampMs: history[0].timestampMs ?? nowMs, elapsedSec: 1 },
+          ]
+        : [
+            {
+              timestampMs: nowMs - 1000,
+              elapsedSec: 0,
+              powerWatts: 0,
+              power3sWatts: 0,
+              targetWatts: 0,
+              heartRateBpm: 0,
+              cadenceRpm: 0,
+              speedKph: 0,
+              wPrimeBalancePct: 100,
+            },
+            {
+              timestampMs: nowMs,
+              elapsedSec: 1,
+              powerWatts: 0,
+              power3sWatts: 0,
+              targetWatts: 0,
+              heartRateBpm: 0,
+              cadenceRpm: 0,
+              speedKph: 0,
+              wPrimeBalancePct: 100,
+            },
+          ];
 
-  for (let i = 0; i < history.length; i++) {
-    const pt = history[i];
-    const ts = fitEpochOffset + pt.elapsedSec;
+  const nowFitSec = Math.floor(nowMs / 1000) - FIT_EPOCH_SEC;
+  const baseStartFitSec = pts[0].timestampMs
+    ? Math.floor(pts[0].timestampMs / 1000) - FIT_EPOCH_SEC
+    : nowFitSec - pts.length;
+
+  // Build strictly monotonic timestamps and accumulate summary stats for lap/session
+  const recordTimestamps: number[] = [];
+  let prevTs = baseStartFitSec - 1;
+  for (let i = 0; i < pts.length; i++) {
+    const candidate = pts[i].timestampMs
+      ? Math.floor(pts[i].timestampMs! / 1000) - FIT_EPOCH_SEC
+      : baseStartFitSec + i;
+    const ts = Math.max(prevTs + 1, candidate);
+    recordTimestamps.push(ts);
+    prevTs = ts;
+  }
+
+  const startFitSec = recordTimestamps[0];
+  const endFitSec = recordTimestamps[recordTimestamps.length - 1];
+  const totalElapsedMs = Math.max(1000, (endFitSec - startFitSec) * 1000);
+  const totalTimerMs = Math.max(1000, pts.length * 1000);
+
+  const dataBytes: number[] = [];
+
+  // 1. file_id (Global MesgNum 0, Local 0)
+  dataBytes.push(
+    0x40, 0x00, 0x00, 0x00, 0x00, 0x06,
+    3, 4, 0x8c, // serial_number (uint32z)
+    4, 4, 0x86, // time_created (uint32)
+    1, 2, 0x84, // manufacturer (uint16)
+    2, 2, 0x84, // product (uint16)
+    5, 2, 0x84, // number (uint16)
+    0, 1, 0x00, // type (enum: 4 = activity)
+    0x00,
+    ...u32(391827461),
+    ...u32(startFitSec),
+    ...u16(1),    // Garmin
+    ...u16(2067), // Edge 520
+    ...u16(1),
+    4             // Activity file
+  );
+
+  // 2. device_info (Global MesgNum 23, Local 1)
+  dataBytes.push(
+    0x41, 0x00, 0x00, 23, 0x00, 0x06,
+    253, 4, 0x86, // timestamp
+    3, 4, 0x8c,   // serial_number
+    2, 2, 0x84,   // manufacturer
+    4, 2, 0x84,   // product
+    5, 2, 0x84,   // software_version
+    0, 1, 0x02,   // device_index (0 = creator)
+    0x01,
+    ...u32(startFitSec),
+    ...u32(391827461),
+    ...u16(1),
+    ...u16(2067),
+    ...u16(100),
+    0
+  );
+
+  // 3. event - Timer Start (Global MesgNum 21, Local 2)
+  dataBytes.push(
+    0x42, 0x00, 0x00, 21, 0x00, 0x04,
+    253, 4, 0x86, // timestamp
+    0, 1, 0x00,   // event (0 = timer)
+    1, 1, 0x00,   // event_type (0 = start)
+    4, 1, 0x02,   // event_group
+    0x02,
+    ...u32(startFitSec),
+    0,
+    0,
+    0
+  );
+
+  // 4. record definition (Global MesgNum 20, Local 3)
+  dataBytes.push(
+    0x43, 0x00, 0x00, 20, 0x00, 0x06,
+    253, 4, 0x86, // timestamp (s since FIT epoch)
+    5, 4, 0x86,   // distance (scale 100 -> cm)
+    6, 2, 0x84,   // speed (scale 1000 -> mm/s)
+    7, 2, 0x84,   // power (watts)
+    3, 1, 0x02,   // heart_rate (bpm, 0xFF = invalid)
+    4, 1, 0x02    // cadence (rpm)
+  );
+
+  let cumDistMeters = 0;
+  let totalWorkJoules = 0;
+  let sumPower = 0;
+  let maxPower = 0;
+  let sumSpeedMmS = 0;
+  let maxSpeedMmS = 0;
+  let sumHr = 0;
+  let hrCount = 0;
+  let maxHr = 0;
+  let sumCad = 0;
+  let maxCad = 0;
+
+  for (let i = 0; i < pts.length; i++) {
+    const pt = pts[i];
+    const ts = recordTimestamps[i];
     const pwr = Math.max(0, Math.min(4000, Math.round(pt.powerWatts)));
-    const hr = Math.max(0, Math.min(250, Math.round(pt.heartRateBpm)));
-    const cad = Math.max(0, Math.min(250, Math.round(pt.cadenceRpm)));
-    const spdMmS = Math.max(0, Math.min(65000, Math.round((pt.speedKph / 3.6) * 1000)));
+    const spdMps = Math.max(0, pt.speedKph / 3.6);
+    const spdMmS = Math.max(0, Math.min(65000, Math.round(spdMps * 1000)));
+    cumDistMeters += spdMps;
+    const distCm = Math.max(0, Math.round(cumDistMeters * 100));
 
-    recordBytes.push(
-      0x00,
-      ts & 0xff,
-      (ts >> 8) & 0xff,
-      (ts >> 16) & 0xff,
-      (ts >> 24) & 0xff,
-      pwr & 0xff,
-      (pwr >> 8) & 0xff,
-      hr & 0xff,
-      cad & 0xff,
-      spdMmS & 0xff,
-      (spdMmS >> 8) & 0xff
+    const validHr = pt.heartRateBpm > 0;
+    const hrByte = validHr ? Math.max(30, Math.min(250, Math.round(pt.heartRateBpm))) : 0xff;
+    const cadByte = Math.max(0, Math.min(250, Math.round(pt.cadenceRpm)));
+
+    totalWorkJoules += pwr;
+    sumPower += pwr;
+    if (pwr > maxPower) maxPower = pwr;
+    sumSpeedMmS += spdMmS;
+    if (spdMmS > maxSpeedMmS) maxSpeedMmS = spdMmS;
+    if (validHr) {
+      sumHr += hrByte;
+      hrCount++;
+      if (hrByte > maxHr) maxHr = hrByte;
+    }
+    sumCad += cadByte;
+    if (cadByte > maxCad) maxCad = cadByte;
+
+    dataBytes.push(
+      0x03,
+      ...u32(ts),
+      ...u32(distCm),
+      ...u16(spdMmS),
+      ...u16(pwr),
+      hrByte,
+      cadByte
     );
   }
 
-  const dataSize = recordBytes.length;
+  // 5. event - Timer Stop All (Global MesgNum 21, Local 2)
+  dataBytes.push(
+    0x02,
+    ...u32(endFitSec),
+    0, // timer
+    4, // stop_all
+    0
+  );
+
+  const totalDistCm = Math.max(0, Math.round(cumDistMeters * 100));
+  const avgPower = Math.round(sumPower / pts.length);
+  const avgSpeedMmS = Math.round(sumSpeedMmS / pts.length);
+  const avgHrByte = hrCount > 0 ? Math.round(sumHr / hrCount) : 0xff;
+  const maxHrByte = hrCount > 0 ? maxHr : 0xff;
+  const avgCadByte = Math.round(sumCad / pts.length);
+
+  // 6. lap (Global MesgNum 19, Local 4)
+  dataBytes.push(
+    0x44, 0x00, 0x00, 19, 0x00, 19,
+    253, 4, 0x86, // timestamp
+    2, 4, 0x86,   // start_time
+    7, 4, 0x86,   // total_elapsed_time (ms)
+    8, 4, 0x86,   // total_timer_time (ms)
+    9, 4, 0x86,   // total_distance (cm)
+    41, 4, 0x86,  // total_work (J)
+    13, 2, 0x84,  // avg_speed (mm/s)
+    14, 2, 0x84,  // max_speed (mm/s)
+    19, 2, 0x84,  // avg_power (W)
+    20, 2, 0x84,  // max_power (W)
+    0, 1, 0x00,   // event (9 = lap)
+    1, 1, 0x00,   // event_type (1 = stop)
+    15, 1, 0x02,  // avg_heart_rate
+    16, 1, 0x02,  // max_heart_rate
+    17, 1, 0x02,  // avg_cadence
+    18, 1, 0x02,  // max_cadence
+    24, 1, 0x00,  // lap_trigger (7 = session_end)
+    25, 1, 0x00,  // sport (2 = cycling)
+    39, 1, 0x00,  // sub_sport (6 = indoor_cycling)
+    0x04,
+    ...u32(endFitSec),
+    ...u32(startFitSec),
+    ...u32(totalElapsedMs),
+    ...u32(totalTimerMs),
+    ...u32(totalDistCm),
+    ...u32(Math.round(totalWorkJoules)),
+    ...u16(avgSpeedMmS),
+    ...u16(maxSpeedMmS),
+    ...u16(avgPower),
+    ...u16(maxPower),
+    9,
+    1,
+    avgHrByte,
+    maxHrByte,
+    avgCadByte,
+    maxCad,
+    7,
+    2,
+    6
+  );
+
+  // 7. session (Global MesgNum 18, Local 5)
+  dataBytes.push(
+    0x45, 0x00, 0x00, 18, 0x00, 21,
+    253, 4, 0x86, // timestamp
+    2, 4, 0x86,   // start_time
+    7, 4, 0x86,   // total_elapsed_time (ms)
+    8, 4, 0x86,   // total_timer_time (ms)
+    9, 4, 0x86,   // total_distance (cm)
+    48, 4, 0x86,  // total_work (J)
+    14, 2, 0x84,  // avg_speed (mm/s)
+    15, 2, 0x84,  // max_speed (mm/s)
+    20, 2, 0x84,  // avg_power (W)
+    21, 2, 0x84,  // max_power (W)
+    25, 2, 0x84,  // first_lap_index (0)
+    26, 2, 0x84,  // num_laps (1)
+    0, 1, 0x00,   // event (8 = session)
+    1, 1, 0x00,   // event_type (1 = stop)
+    5, 1, 0x00,   // sport (2 = cycling)
+    6, 1, 0x00,   // sub_sport (6 = indoor_cycling)
+    16, 1, 0x02,  // avg_heart_rate
+    17, 1, 0x02,  // max_heart_rate
+    18, 1, 0x02,  // avg_cadence
+    19, 1, 0x02,  // max_cadence
+    28, 1, 0x00,  // trigger (0 = activity_end)
+    0x05,
+    ...u32(endFitSec),
+    ...u32(startFitSec),
+    ...u32(totalElapsedMs),
+    ...u32(totalTimerMs),
+    ...u32(totalDistCm),
+    ...u32(Math.round(totalWorkJoules)),
+    ...u16(avgSpeedMmS),
+    ...u16(maxSpeedMmS),
+    ...u16(avgPower),
+    ...u16(maxPower),
+    ...u16(0),
+    ...u16(1),
+    8,
+    1,
+    2,
+    6,
+    avgHrByte,
+    maxHrByte,
+    avgCadByte,
+    maxCad,
+    0
+  );
+
+  // 8. activity (Global MesgNum 34, Local 6)
+  const tzOffsetSec = new Date().getTimezoneOffset() * -60;
+  const localEndFitSec = Math.max(0, endFitSec + tzOffsetSec);
+  dataBytes.push(
+    0x46, 0x00, 0x00, 34, 0x00, 0x07,
+    253, 4, 0x86, // timestamp
+    0, 4, 0x86,   // total_timer_time (ms)
+    5, 4, 0x86,   // local_timestamp
+    1, 2, 0x84,   // num_sessions (1)
+    2, 1, 0x00,   // type (0 = manual)
+    3, 1, 0x00,   // event (26 = activity)
+    4, 1, 0x00,   // event_type (1 = stop)
+    0x06,
+    ...u32(endFitSec),
+    ...u32(totalTimerMs),
+    ...u32(localEndFitSec),
+    ...u16(1),
+    0,
+    26,
+    1
+  );
+
+  const dataSize = dataBytes.length;
   const totalBuffer = new Uint8Array(14 + dataSize + 2);
 
-  totalBuffer[0] = 14;
-  totalBuffer[1] = 0x20;
-  totalBuffer[2] = 0x14;
-  totalBuffer[3] = 0x08;
+  totalBuffer[0] = 14;   // Header size
+  totalBuffer[1] = 0x10; // Protocol version 1.0
+  totalBuffer[2] = 0x41; // Profile version 2113 LSB
+  totalBuffer[3] = 0x08; // Profile version 2113 MSB
   totalBuffer[4] = dataSize & 0xff;
-  totalBuffer[5] = (dataSize >> 8) & 0xff;
-  totalBuffer[6] = (dataSize >> 16) & 0xff;
-  totalBuffer[7] = (dataSize >> 24) & 0xff;
-  totalBuffer[8] = 0x2e;
-  totalBuffer[9] = 0x46;
-  totalBuffer[10] = 0x49;
-  totalBuffer[11] = 0x54;
+  totalBuffer[5] = (dataSize >>> 8) & 0xff;
+  totalBuffer[6] = (dataSize >>> 16) & 0xff;
+  totalBuffer[7] = (dataSize >>> 24) & 0xff;
+  totalBuffer[8] = 0x2e;  // '.'
+  totalBuffer[9] = 0x46;  // 'F'
+  totalBuffer[10] = 0x49; // 'I'
+  totalBuffer[11] = 0x54; // 'T'
   const headerCrc = computeFitCrc16(totalBuffer, 12);
   totalBuffer[12] = headerCrc & 0xff;
-  totalBuffer[13] = (headerCrc >> 8) & 0xff;
+  totalBuffer[13] = (headerCrc >>> 8) & 0xff;
 
-  totalBuffer.set(recordBytes, 14);
+  totalBuffer.set(dataBytes, 14);
   const fileCrc = computeFitCrc16(totalBuffer, 14 + dataSize);
   totalBuffer[14 + dataSize] = fileCrc & 0xff;
-  totalBuffer[14 + dataSize + 1] = (fileCrc >> 8) & 0xff;
+  totalBuffer[14 + dataSize + 1] = (fileCrc >>> 8) & 0xff;
 
   return totalBuffer;
 }
@@ -1186,19 +1496,68 @@ export function encodeTelemetryToTcxXml(
   workoutTitle: string,
   history: TelemetryHistoryPoint[]
 ): string {
-  const startIso = new Date(Date.now() - history.length * 1000).toISOString();
-  const trackpoints = history
-    .map((pt) => {
-      const ptIso = new Date(
-        Date.parse(startIso) + pt.elapsedSec * 1000
-      ).toISOString();
+  const nowMs = Date.now();
+  const pts: TelemetryHistoryPoint[] =
+    history.length >= 2
+      ? history
+      : history.length === 1
+        ? [
+            { ...history[0], timestampMs: (history[0].timestampMs ?? nowMs) - 1000, elapsedSec: 0 },
+            { ...history[0], timestampMs: history[0].timestampMs ?? nowMs, elapsedSec: 1 },
+          ]
+        : [
+            {
+              timestampMs: nowMs - 1000,
+              elapsedSec: 0,
+              powerWatts: 0,
+              power3sWatts: 0,
+              targetWatts: 0,
+              heartRateBpm: 0,
+              cadenceRpm: 0,
+              speedKph: 0,
+              wPrimeBalancePct: 100,
+            },
+            {
+              timestampMs: nowMs,
+              elapsedSec: 1,
+              powerWatts: 0,
+              power3sWatts: 0,
+              targetWatts: 0,
+              heartRateBpm: 0,
+              cadenceRpm: 0,
+              speedKph: 0,
+              wPrimeBalancePct: 100,
+            },
+          ];
+
+  const baseStartMs = pts[0].timestampMs ?? nowMs - pts.length * 1000;
+  const startIso = new Date(baseStartMs).toISOString();
+  let prevMs = baseStartMs - 1000;
+  let cumDistMeters = 0;
+  let totalJoules = 0;
+
+  const trackpoints = pts
+    .map((pt, idx) => {
+      const candidateMs = pt.timestampMs ?? baseStartMs + idx * 1000;
+      const pointMs = Math.max(prevMs + 1000, candidateMs);
+      prevMs = pointMs;
+      const ptIso = new Date(pointMs).toISOString();
+      const spdMps = Math.max(0, pt.speedKph / 3.6);
+      cumDistMeters += spdMps;
+      totalJoules += Math.max(0, pt.powerWatts);
+
+      const hrXml =
+        pt.heartRateBpm > 0
+          ? `\n            <HeartRateBpm><Value>${Math.round(pt.heartRateBpm)}</Value></HeartRateBpm>`
+          : '';
+
       return `          <Trackpoint>
             <Time>${ptIso}</Time>
-            <HeartRateBpm><Value>${Math.round(pt.heartRateBpm)}</Value></HeartRateBpm>
+            <DistanceMeters>${cumDistMeters.toFixed(2)}</DistanceMeters>${hrXml}
             <Cadence>${Math.round(pt.cadenceRpm)}</Cadence>
             <Extensions>
               <TPX xmlns="http://www.garmin.com/xmlschemas/ActivityExtension/v2">
-                <Speed>${(pt.speedKph / 3.6).toFixed(2)}</Speed>
+                <Speed>${spdMps.toFixed(2)}</Speed>
                 <Watts>${Math.round(pt.powerWatts)}</Watts>
               </TPX>
             </Extensions>
@@ -1206,14 +1565,19 @@ export function encodeTelemetryToTcxXml(
     })
     .join('\n');
 
+  const totalTimeSec = Math.max(1, Math.round((prevMs - baseStartMs) / 1000) + 1);
+  const calories = Math.max(1, Math.round(totalJoules / 1000));
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <TrainingCenterDatabase xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2">
   <Activities>
     <Activity Sport="Biking">
       <Id>${startIso}</Id>
-      <Notes>VeloCore WASM Session: ${workoutTitle}</Notes>
+      <Notes>VeloCore Session: ${workoutTitle}</Notes>
       <Lap StartTime="${startIso}">
-        <TotalTimeSeconds>${history.length}</TotalTimeSeconds>
+        <TotalTimeSeconds>${totalTimeSec}</TotalTimeSeconds>
+        <DistanceMeters>${cumDistMeters.toFixed(2)}</DistanceMeters>
+        <Calories>${calories}</Calories>
         <Intensity>Active</Intensity>
         <TriggerMethod>Manual</TriggerMethod>
         <Track>
@@ -1223,4 +1587,279 @@ ${trackpoints}
     </Activity>
   </Activities>
 </TrainingCenterDatabase>`;
+}
+
+// ============================================================================
+// Plain-Text (.txt) Persistence for Workouts & Rider Profile
+// ============================================================================
+
+const WORKOUTS_LOCAL_STORAGE_KEY = 'velocore_workouts_txt_v1';
+const RIDER_PROFILE_LOCAL_STORAGE_KEY = 'velocore_rider_profile_txt_v1';
+
+function formatSecAsShorthandDuration(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  if (m > 0 && s > 0) return `${m}m${s}s`;
+  if (m > 0) return `${m}m`;
+  return `${s}s`;
+}
+
+/**
+ * Serializes a single `StructuredWorkout` into the human-editable `.txt` block format
+ */
+export function serializeWorkoutToShorthandTxt(workout: StructuredWorkout): string {
+  const headerLines = [
+    '=== WORKOUT ===',
+    `@id: ${workout.id}`,
+    `@name: ${workout.title}`,
+    `@author: ${workout.author}`,
+    `@category: ${workout.category}`,
+    `@description: ${workout.description.replace(/\r?\n/g, ' ')}`,
+    '',
+  ];
+
+  const stepLines = workout.segments.map((seg) => {
+    const dur = formatSecAsShorthandDuration(seg.durationSec);
+    const pwr =
+      seg.endTargetFtpPct !== undefined
+        ? `${Math.round(seg.targetFtpPct * 100)}%->${Math.round(seg.endTargetFtpPct * 100)}%`
+        : `${Math.round(seg.targetFtpPct * 100)}%`;
+    const cad = seg.targetCadenceRpm ? ` ${seg.targetCadenceRpm}rpm` : '';
+    const cuePart =
+      seg.coachCue && seg.coachCue !== seg.name ? ` | ${seg.coachCue.replace(/\r?\n/g, ' ')}` : '';
+    return `${dur} @ ${pwr}${cad} - ${seg.name}${cuePart}`;
+  });
+
+  return [...headerLines, ...stepLines].join('\n');
+}
+
+/**
+ * Serializes the full workout library into `workouts.txt` format
+ */
+export function serializeWorkoutsLibraryToTxt(workouts: StructuredWorkout[]): string {
+  const preamble = [
+    '# VeloCore Structured Workouts Library (workouts.txt)',
+    '# Blocks are separated by "=== WORKOUT ==="',
+    '# Metadata directives: @id, @name, @author, @category, @description',
+    '# Interval lines: <duration> @ <power% or ramp%> [cadence] - <Label> | <Coach Cue>',
+    '',
+  ].join('\n');
+
+  return `${preamble}\n${workouts.map(serializeWorkoutToShorthandTxt).join('\n\n')}\n`;
+}
+
+/**
+ * Parses a multi-workout `workouts.txt` document into `StructuredWorkout[]`
+ */
+export function parseWorkoutsLibraryFromTxt(
+  txt: string,
+  ftpWatts: number = 280
+): StructuredWorkout[] {
+  const trimmed = txt.trim();
+  if (!trimmed) return [];
+
+  const rawBlocks = trimmed.split(/^===\s*WORKOUT\s*===\s*$/im);
+  const parsed: StructuredWorkout[] = [];
+
+  for (const rawBlock of rawBlocks) {
+    const cleanBlock = rawBlock
+      .split(/\r?\n/)
+      .filter((l) => !l.trim().startsWith('#'))
+      .join('\n')
+      .trim();
+    if (!cleanBlock) continue;
+    try {
+      const workout = parseShorthandWorkout(cleanBlock, ftpWatts || 280);
+      parsed.push(workout);
+    } catch {
+      // Skip malformed block
+    }
+  }
+
+  return parsed;
+}
+
+/**
+ * Loads the workout library from `/api/workouts-txt` (or `/workouts.txt` / localStorage fallback)
+ */
+export async function loadWorkoutsFromTxtFile(ftpWatts: number = 280): Promise<StructuredWorkout[]> {
+  try {
+    const res = await fetch('/api/workouts-txt', { cache: 'no-store' });
+    if (res.ok) {
+      const txt = await res.text();
+      const workouts = parseWorkoutsLibraryFromTxt(txt, ftpWatts);
+      if (workouts.length > 0) {
+        try {
+          window.localStorage.setItem(WORKOUTS_LOCAL_STORAGE_KEY, txt);
+        } catch {
+          // Ignore storage quota errors
+        }
+        return workouts;
+      }
+    }
+  } catch {
+    // Fallback to static /workouts.txt or localStorage
+  }
+
+  try {
+    const cachedTxt = window.localStorage.getItem(WORKOUTS_LOCAL_STORAGE_KEY);
+    if (cachedTxt) {
+      const cachedWorkouts = parseWorkoutsLibraryFromTxt(cachedTxt, ftpWatts);
+      if (cachedWorkouts.length > 0) return cachedWorkouts;
+    }
+  } catch {
+    // Ignore localStorage error
+  }
+
+  try {
+    const staticRes = await fetch('/workouts.txt', { cache: 'no-store' });
+    if (staticRes.ok) {
+      const txt = await staticRes.text();
+      const workouts = parseWorkoutsLibraryFromTxt(txt, ftpWatts);
+      if (workouts.length > 0) return workouts;
+    }
+  } catch {
+    // Ignore fetch error
+  }
+
+  return BUILTIN_WORKOUTS;
+}
+
+/**
+ * Persists the workout library to `public/workouts.txt` on disk (via Vite middleware) and localStorage
+ */
+export async function saveWorkoutsToTxtFile(workouts: StructuredWorkout[]): Promise<boolean> {
+  const txt = serializeWorkoutsLibraryToTxt(workouts);
+  try {
+    window.localStorage.setItem(WORKOUTS_LOCAL_STORAGE_KEY, txt);
+  } catch {
+    // Ignore storage error
+  }
+
+  try {
+    const res = await fetch('/api/workouts-txt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      body: txt,
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export interface RiderProfileMetrics {
+  ftpWatts: number;
+  weightKg: number;
+}
+
+export function serializeRiderProfileToTxt(profile: RiderProfileMetrics): string {
+  return [
+    '# VeloCore Rider Profile Metrics (rider-profile.txt)',
+    `ftpWatts = ${profile.ftpWatts}`,
+    `weightKg = ${profile.weightKg}`,
+    '',
+  ].join('\n');
+}
+
+export function parseRiderProfileFromTxt(txt: string): RiderProfileMetrics | null {
+  let ftpWatts: number | null = null;
+  let weightKg: number | null = null;
+
+  const lines = txt.split(/\r?\n/);
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const match = line.match(/^([a-zA-Z0-9_]+)\s*[:=]\s*(-?\d+(?:\.\d+)?)$/);
+    if (!match) continue;
+    const key = match[1].toLowerCase();
+    const val = Number(match[2]);
+    if (!Number.isFinite(val)) continue;
+    if (key === 'ftpwatts' || key === 'ftp') {
+      ftpWatts = Math.max(0, Math.min(1000, Math.round(val)));
+    } else if (key === 'weightkg' || key === 'weight' || key === 'kg' || key === 'mass') {
+      weightKg = Math.max(0, Math.min(300, Number(val.toFixed(1))));
+    }
+  }
+
+  if (ftpWatts === null && weightKg === null) return null;
+  return {
+    ftpWatts: ftpWatts ?? 280,
+    weightKg: weightKg ?? 72,
+  };
+}
+
+export async function loadRiderProfileFromTxtFile(): Promise<RiderProfileMetrics | null> {
+  try {
+    const res = await fetch('/api/rider-profile-txt', { cache: 'no-store' });
+    if (res.ok) {
+      const txt = await res.text();
+      const parsed = parseRiderProfileFromTxt(txt);
+      if (parsed) {
+        try {
+          window.localStorage.setItem(RIDER_PROFILE_LOCAL_STORAGE_KEY, txt);
+        } catch {
+          // Ignore storage error
+        }
+        return parsed;
+      }
+    }
+  } catch {
+    // Ignore API fetch error
+  }
+
+  try {
+    const cachedTxt = window.localStorage.getItem(RIDER_PROFILE_LOCAL_STORAGE_KEY);
+    if (cachedTxt) {
+      const parsed = parseRiderProfileFromTxt(cachedTxt);
+      if (parsed) return parsed;
+    }
+  } catch {
+    // Ignore localStorage error
+  }
+
+  try {
+    const staticRes = await fetch('/rider-profile.txt', { cache: 'no-store' });
+    if (staticRes.ok) {
+      const txt = await staticRes.text();
+      const parsed = parseRiderProfileFromTxt(txt);
+      if (parsed) return parsed;
+    }
+  } catch {
+    // Ignore static fetch error
+  }
+
+  return null;
+}
+
+export async function saveRiderProfileToTxtFile(profile: RiderProfileMetrics): Promise<boolean> {
+  const txt = serializeRiderProfileToTxt(profile);
+  try {
+    window.localStorage.setItem(RIDER_PROFILE_LOCAL_STORAGE_KEY, txt);
+  } catch {
+    // Ignore localStorage error
+  }
+
+  try {
+    const res = await fetch('/api/rider-profile-txt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      body: txt,
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export function downloadTextFile(filename: string, content: string): void {
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }

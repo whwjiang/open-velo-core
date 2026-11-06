@@ -1,9 +1,13 @@
 import React, { useState } from 'react';
 
-const RUST_SOURCE_SNIPPET = `#![no_std]
+const RUST_SOURCE_SNIPPET = `//! VeloCore Core Engine (velocore-core/src/lib.rs)
+//! Compiles via: cargo build --manifest-path velocore-core/Cargo.toml --target wasm32-unknown-unknown --release
 
-//! VeloCore WASM Telemetry & Smart Trainer Protocol Engine (rust-telemetry-core/src/lib.rs)
-//! Compiles via: cargo build --target wasm32-unknown-unknown --release
+pub mod fit;
+pub mod game;
+pub mod physiology;
+pub mod protocol;
+pub mod session;
 
 static mut INBOUND_FRAME_BUF: [u8; 64] = [0u8; 64];
 static mut OUTBOUND_FRAME_BUF: [u8; 16] = [0u8; 16];
@@ -93,7 +97,7 @@ export const RustSdkView: React.FC = () => {
               Decoupled Rust-to-WASM Architecture &amp; Headless Frontend Bridge
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Zero-copy linear memory architecture located in <code className="font-mono">rust-telemetry-core/src/lib.rs</code>. Designed to hook into any UI or 3D engine without modifying sensor or trainer protocol logic.
+              Zero-copy linear memory architecture located in <code className="font-mono">velocore-core/src/</code>. Designed to hook into any UI or 3D engine without modifying sensor or trainer protocol logic.
             </p>
           </div>
           <button
@@ -139,7 +143,7 @@ export const RustSdkView: React.FC = () => {
           <div className="flex items-center justify-between gap-2">
             <div>
               <h3 className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-                Rust #![no_std] WebAssembly Core (rust-telemetry-core/src/lib.rs)
+                Rust WebAssembly Core (velocore-core/src/)
               </h3>
             </div>
             <button

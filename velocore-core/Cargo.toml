@@ -1,0 +1,16 @@
+[package]
+name = "velocore-core"
+version = "0.3.0"
+edition = "2021"
+description = "VeloCore Rust/WASM Engine: ANT+ & BLE cycling protocols, physiological W'bal/NP modeling, Newspaper Delivery Game compliance scoring, and Garmin .FIT activity encoding."
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

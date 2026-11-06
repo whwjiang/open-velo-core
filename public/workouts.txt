@@ -1,0 +1,78 @@
+# VeloCore Structured Workouts Library (workouts.txt)
+# Blocks are separated by "=== WORKOUT ==="
+# Metadata directives: @id, @name, @author, @category, @description
+# Interval lines: <duration> @ <power% or ramp%> [cadence] - <Label> | <Coach Cue>
+
+=== WORKOUT ===
+@id: short-1793931009385
+@name: Petite 75m
+@author: VeloCore Shorthand Compiler
+@category: Custom Import
+@description: Z2 endurance ride
+
+75m @ 50% 90rpm - EZ
+
+=== WORKOUT ===
+@id: sweetspot-over-under-45
+@name: Anaerobic Over-Under & W'bal Depletion
+@author: VeloCore Performance Lab
+@category: Threshold
+@description: Classiclactate shuttle & W'bal validation session. Alternates 92% sub-threshold clearance with 108% supra-threshold surges to exercise the Skiba differential W'bal model and FE-C Page 49 ERG commands.
+
+3m @ 50%->75% 88rpm - - Progressive Warmup | Spin smoothly; allow trainer flywheel and core temperature to stabilize.
+1m @ 112% 105rpm - - Primer Opener 1 | High-cadence neuromuscular activation before main set.
+1m30s @ 55% 85rpm - - Easy Spin | Deep diaphragmatic breathing before Over-Under block.
+3m @ 93% 90rpm - - Block 1 · Under (93% FTP) | Settle into steady Sweet Spot torque; W'bal remains 100%.
+2m @ 108% 96rpm - - Block 1 · Over (108% FTP) | Push over threshold! Watch W'bal deplete exponentially in real time.
+3m @ 92% 90rpm - - Block 1 · Under Clearance | Clear lactate while still holding 92% FTP; W'bal slowly reconstitutes.
+2m @ 110% 98rpm - - Block 1 · Peak Surge (110%) | Hold form through the second supra-threshold surge.
+3m @ 55% 85rpm - - Mid-Workout Valley | Full aerobic recovery; verify exponential W'bal reconstitution curve.
+1m30s @ 120% 102rpm - - VO2max Booster 1 (120%) | High aerobic ceiling effort; drive brisk pedal stroke over the top.
+1m30s @ 55% 85rpm - - Float Recovery | Relax shoulders and grip.
+1m30s @ 122% 104rpm - - VO2max Booster 2 (122%) | Final deep W'bal draw—empty the anaerobic tank!
+3m @ 65%->45% 82rpm - - Cooldown Ramp | Gradual ERG wattage step-down.
+
+=== WORKOUT ===
+@id: vo2max-ronnestad-30-15
+@name: Rønnestad 30/15 Micro-Intervals
+@author: Norwegian Olympic Federation Protocol
+@category: VO2max
+@description: Rapid 30-second 128% VO2max micro-bursts paired with 15-second 55% floats. Exercises high-frequency ANT+ FE-C Page 49 & BLE FTMS 0x2AD9 target power transitions.
+
+3m @ 55%->80% 90rpm - - Warmup Ramp | Smoothly build cadence and core temperature.
+30s @ 128% 105rpm - - Rep 1 · 30s ON | Instant ERG step—stay seated and drive high cadence.
+15s @ 55% 85rpm - - Rep 1 · 15s Float | Quick micro-recovery before next ERG step.
+30s @ 128% 105rpm - - Rep 2 · 30s ON | Maintain smooth torque through the transition.
+15s @ 55% 85rpm - - Rep 2 · 15s Float | Breathe deeply; keep pedals turning.
+30s @ 128% 106rpm - - Rep 3 · 30s ON | Watch W'bal staircase downward with each 30s effort.
+15s @ 55% 85rpm - - Rep 3 · 15s Float | Short float.
+30s @ 130% 108rpm - - Rep 4 · 30s ON | Final micro-burst of the set!
+3m @ 60%->45% 85rpm - - Cooldown | Spin easy to flush metabolites.
+
+=== WORKOUT ===
+@id: anaerobic-wbal-test-lab
+@name: Skiba W'bal Exhaustion & Recovery Benchmark
+@author: VeloCore Sports Science
+@category: Anaerobic
+@description: Designed specifically to stress-test the Rust/WASM Skiba W'bal differential integrator across severe 135%-150% anaerobic surges and variable recovery valleys.
+
+2m @ 60% 90rpm - - Baseline Spin (100% W'bal) | Sub-CP baseline; W'bal holds steady at 20.0 kJ.
+1m15s @ 138% 105rpm - - Surge 1 · 138% CP | Linear W' depletion above Critical Power.
+2m @ 62% 88rpm - - Recovery Valley (62% CP) | Observe exponential W'bal reconstitution (tau_W').
+1m @ 148% 110rpm - - Surge 2 · 148% CP | Deep anaerobic draw into red zone.
+2m30s @ 50% 85rpm - - Deep Recovery (50% CP) | Faster tau_W' recovery at lower sub-CP wattage.
+2m @ 55%->45% 85rpm - - Cooldown | Return to baseline.
+
+=== WORKOUT ===
+@id: tempo-aerobic-endurance-30
+@name: Foundation Tempo & Cadence Pyramids
+@author: VeloCore Coaching
+@category: Endurance
+@description: Sustained Zone 2/3 aerobic engine builder with structured cadence variations (75 RPM torque work vs 100 RPM spin efficiency).
+
+3m @ 52%->70% 88rpm - - Easy Aerobic Ramp | Settle into rhythmic pedaling.
+4m @ 76% 92rpm - - Z2/Z3 Endurance Cruise | Steady aerobic state; monitor left/right pedal balance.
+4m @ 84% 76rpm - - Low-Cadence Torque (76 RPM) | Muscular tension block; focus on early dead-spot engagement.
+2m @ 65% 90rpm - - Easy Spin | Relax legs between tempo blocks.
+4m @ 86% 100rpm - - High-Cadence Tempo (100 RPM) | Cardiovascular shift with supple high-speed leg turnover.
+3m @ 65%->48% 85rpm - - Cooldown | Spin down easily.

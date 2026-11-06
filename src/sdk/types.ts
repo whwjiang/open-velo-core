@@ -47,11 +47,24 @@ export interface ProtocolFrameAudit {
   fields: DecodedByteField[];
 }
 
+export interface IntervalCompletionReport {
+  intervalIndex: number;
+  segmentId: string;
+  segmentName: string;
+  compliancePct: number;
+  deliveryTier: 0 | 1 | 2 | 3; // 0 = Missed, 1 = Bronze/Lawn, 2 = Silver/Porch, 3 = Gold/Mailbox
+  coinsEarned: number;
+  totalCoins: number;
+  averagePowerWatts: number;
+  targetPowerWatts: number;
+}
+
 export interface TelemetrySnapshot {
   timestampMs: number;
   elapsedSec: number;
   intervalElapsedSec: number;
   intervalRemainingSec: number;
+  intervalProgress01: number; // 0.0 to 1.0 progress within current interval for 60 FPS game sprites
   activeIntervalIndex: number;
 
   // Instant & Smoothed Power
@@ -59,17 +72,21 @@ export interface TelemetrySnapshot {
   power3sWatts: number;
   power10sWatts: number;
   power30sWatts: number;
+  intervalPowerWatts: number;
   normalizedPowerWatts: number;
   averagePowerWatts: number;
   maxPowerWatts: number;
   wattsPerKg: number;
 
-  // Target & Trainer State
+  // Target, Trainer State & Game Compliance (Plug-and-Play Frontend Support)
   targetPowerWatts: number;
   trainerMode: TrainerControlMode;
   targetSlopePct: number;
   targetResistancePct: number;
   intensityBiasPct: number;
+  intervalCompliancePct: number;
+  intervalCadenceCompliancePct: number;
+  totalCoinsEarned: number;
 
   // Biometrics & Kinematics
   heartRateBpm: number;
@@ -99,6 +116,7 @@ export interface TelemetrySnapshot {
 }
 
 export interface TelemetryHistoryPoint {
+  timestampMs?: number;
   elapsedSec: number;
   powerWatts: number;
   power3sWatts: number;

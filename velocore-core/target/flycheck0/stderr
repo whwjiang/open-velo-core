@@ -1,0 +1,90 @@
+   0.017980430s  INFO prepare_target{force=false package_id=velocore-core v0.3.0 (/home/whjiang/src/projects/open-velo-core/velocore-core) target="velocore_core"}: cargo::core::compiler::fingerprint: fingerprint error for velocore-core v0.3.0 (/home/whjiang/src/projects/open-velo-core/velocore-core)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("velocore_core", ["cdylib", "rlib"], "/home/whjiang/src/projects/open-velo-core/velocore-core/src/lib.rs", Edition2021) }
+   0.018018079s  INFO prepare_target{force=false package_id=velocore-core v0.3.0 (/home/whjiang/src/projects/open-velo-core/velocore-core) target="velocore_core"}: cargo::core::compiler::fingerprint:     err: failed to read `/home/whjiang/src/projects/open-velo-core/velocore-core/target/debug/.fingerprint/velocore-core-6179c984312cd0ec/lib-velocore_core`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: cargo_util::paths::read_bytes
+   1: cargo_util::paths::read
+   2: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   3: cargo::core::compiler::fingerprint::prepare_target
+   4: cargo::core::compiler::compile
+   5: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   6: cargo::ops::cargo_compile::compile_ws
+   7: cargo::ops::cargo_compile::compile_with_exec
+   8: cargo::ops::cargo_compile::compile
+   9: cargo::commands::check::exec
+  10: <cargo::cli::Exec>::exec
+  11: cargo::main
+  12: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  13: std::rt::lang_start::<()>::{closure#0}
+  14: core::ops::function::impls::<impl core::ops::function::FnOnce<A> for &F>::call_once
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/ops/function.rs:287:21
+  15: std::panicking::catch_unwind::do_call
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:581:40
+  16: std::panicking::catch_unwind
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:544:19
+  17: std::panic::catch_unwind
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panic.rs:359:14
+  18: std::rt::lang_start_internal::{{closure}}
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/rt.rs:175:24
+  19: std::panicking::catch_unwind::do_call
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:581:40
+  20: std::panicking::catch_unwind
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:544:19
+  21: std::panic::catch_unwind
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panic.rs:359:14
+  22: std::rt::lang_start_internal
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/rt.rs:171:5
+  23: main
+  24: __libc_start_call_main
+  25: __libc_start_main@@GLIBC_2.34
+  26: <unknown>
+   0.030930262s  INFO prepare_target{force=false package_id=velocore-core v0.3.0 (/home/whjiang/src/projects/open-velo-core/velocore-core) target="velocore_core"}: cargo::core::compiler::fingerprint: fingerprint error for velocore-core v0.3.0 (/home/whjiang/src/projects/open-velo-core/velocore-core)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("velocore_core", ["cdylib", "rlib"], "/home/whjiang/src/projects/open-velo-core/velocore-core/src/lib.rs", Edition2021) }
+   0.030962437s  INFO prepare_target{force=false package_id=velocore-core v0.3.0 (/home/whjiang/src/projects/open-velo-core/velocore-core) target="velocore_core"}: cargo::core::compiler::fingerprint:     err: failed to read `/home/whjiang/src/projects/open-velo-core/velocore-core/target/debug/.fingerprint/velocore-core-746779b34ae4115a/test-lib-velocore_core`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: cargo_util::paths::read_bytes
+   1: cargo_util::paths::read
+   2: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   3: cargo::core::compiler::fingerprint::prepare_target
+   4: cargo::core::compiler::compile
+   5: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   6: cargo::ops::cargo_compile::compile_ws
+   7: cargo::ops::cargo_compile::compile_with_exec
+   8: cargo::ops::cargo_compile::compile
+   9: cargo::commands::check::exec
+  10: <cargo::cli::Exec>::exec
+  11: cargo::main
+  12: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  13: std::rt::lang_start::<()>::{closure#0}
+  14: core::ops::function::impls::<impl core::ops::function::FnOnce<A> for &F>::call_once
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/ops/function.rs:287:21
+  15: std::panicking::catch_unwind::do_call
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:581:40
+  16: std::panicking::catch_unwind
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:544:19
+  17: std::panic::catch_unwind
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panic.rs:359:14
+  18: std::rt::lang_start_internal::{{closure}}
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/rt.rs:175:24
+  19: std::panicking::catch_unwind::do_call
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:581:40
+  20: std::panicking::catch_unwind
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:544:19
+  21: std::panic::catch_unwind
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panic.rs:359:14
+  22: std::rt::lang_start_internal
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/rt.rs:171:5
+  23: main
+  24: __libc_start_call_main
+  25: __libc_start_main@@GLIBC_2.34
+  26: <unknown>
+    Checking velocore-core v0.3.0 (/home/whjiang/src/projects/open-velo-core/velocore-core)
+error: could not compile `velocore-core` (lib) due to 7 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `velocore-core` (lib test) due to 8 previous errors

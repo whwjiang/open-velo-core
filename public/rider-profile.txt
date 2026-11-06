@@ -1,0 +1,3 @@
+# VeloCore Rider Profile Metrics (rider-profile.txt)
+ftpWatts = 250
+weightKg = 75
