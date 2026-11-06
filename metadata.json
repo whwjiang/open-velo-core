@@ -1,0 +1,6 @@
+{
+  "name": "VeloCore WASM",
+  "description": "Low-latency ANT+ (WebUSB) and Bluetooth Low Energy (WebBluetooth) cycling workout cockpit and protocol analyzer powered by a Rust-to-WebAssembly telemetry engine.",
+  "requestFramePermissions": ["usb", "bluetooth"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
