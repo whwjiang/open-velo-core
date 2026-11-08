@@ -1,25 +1,28 @@
 # Open VeloCore (`open-velo-core`)
 
-**Open VeloCore** is an open-source, local-first indoor cycling telemetry, smart trainer control, and game-ready workout engine built on a modular **Rust / WebAssembly (`velocore-core`)** core and a headless TypeScript SDK.
+**Open VeloCore** is a standalone, self-contained **Rust / WebAssembly + TypeScript SDK** for indoor cycling telemetry, smart trainer control, physiological modeling, workout target compliance evaluation, and standards-compliant Garmin `.FIT` / `.TCX` activity encoding.
 
-It is designed both as a standalone indoor training cockpit and as a **plug-and-play backend** for interactive 2D/3D cycling games—specifically targeting an **EarthBound / Stardew Valley–inspired Newspaper Delivery RPG**, where workout intervals map to neighborhood houses and power/cadence compliance determines throw accuracy, delivery tiers, and coin rewards.
+It is built to run **100% self-contained in the browser** with zero UI framework dependencies and zero external server requirements. The compiled Rust WebAssembly binary (`open_velo_core.wasm`) is automatically embedded directly into the SDK package so any frontend or application layer can install `open-velo-core` and attach to real-time telemetry and lifecycle hooks.
 
 ---
 
-## Features
+## Key Capabilities
 
-- **Rust/WASM Telemetry & Session Core (`velocore-core`)**
-  - **Protocol Layer (`protocol.rs`)**: ANT+ USB (`0xA4`) XOR checksum verification, 8-bit/16-bit rollover-safe counter arithmetic, inbound ANT+ FE-C (`0x19` / `0x10`), Cycling Power (`0x10`), and Heart Rate (`0x04`) packet decoding, and outbound ANT+ FE-C control frame encoding (Page 48 Basic Resistance, Page 49 ERG Target Power, Page 51 Track Slope/Grade).
-  - **Physiology Layer (`physiology.rs`)**: Sub-second time-windowed rolling power averages (`3s`, `10s`, `30s`), Normalized Power (`NP`), Intensity Factor (`IF`), Training Stress Score (`TSS`), and Skiba differential $W'\text{bal}$ anaerobic reserve modeling.
-  - **Game Compliance & Scoring Layer (`game.rs`)**: Real-time interval power (`±5%` bullseye) and cadence (`±5 RPM` bullseye) compliance scoring, delivery tier classification (`Gold / Mailbox`, `Silver / Porch`, `Bronze / Lawn`, `Missed`), and coin/tip payouts.
-  - **Activity File Export (`fit.rs`)**: Standards-compliant binary Garmin `.FIT` encoder (including `file_id`, `device_info`, `event`, `record`, `lap`, `session`, `activity`, and header/file CRC-16) and `.TCX` XML export verified for **Strava** and **Garmin Connect**.
-- **Headless TypeScript Bridge (`VeloCoreEngine`)**
-  - Pub/sub state snapshots (`subscribeTelemetry`) decoupled from the rendering layer so React, Phaser, PixiJS, Three.js, or custom Canvas game loops can subscribe without touching protocol or physiological math.
-- **Plain-Text Persistence (`public/*.txt`)**
-  - Workouts are loaded from and persisted to `public/workouts.txt` (with `.zwo` / `.erg` / `.mrc` import support).
-  - Rider profile metrics (`FTP` and `Weight kg`) are persisted to `public/rider-profile.txt`.
-- **Optional Hardware Debug & Synthetic Wire Mode**
-  - Clean user-facing experience by default; enable **Debug Mode** in the Hardware modal to inspect raw hex frames in the Packet Sniffer or drive the engine with synthetic 4Hz ANT+ / BLE wire packets.
+1. **Wire Protocol Codecs & Rollover Math (`rust/protocol.rs`)**
+   - **ANT+ USB (`0xA4`)**: XOR frame checksum verification, 8-bit/16-bit rollover-safe counter deltas, inbound decoding for FE-C (`0x19` Stationary Bike, `0x10` General FE), Cycling Power (`0x10`), and Heart Rate (`0x04`).
+   - **Smart Trainer Control**: Outbound frame encoding for ANT+ FE-C Page 48 (Basic Resistance), Page 49 (ERG Target Power), and Page 51 (Track Grade / Slope), plus BLE FTMS (`0x2AD9`) control opcodes.
+2. **Physiological Modeling & Rolling Power Windows (`rust/physiology.rs` & `rust/session.rs`)**
+   - Time-windowed sub-second rolling power averages (`3s`, `10s`, `30s`) resilient to variable sensor packet rates.
+   - Skiba differential $W'\text{bal}$ anaerobic work capacity depletion and exponential recovery integration.
+   - Normalized Power (`NP`), Intensity Factor (`IF`), Training Stress Score (`TSS`), Watts/kg, and Work (`kJ`).
+3. **Workout Target Compliance (`rust/compliance.rs`)**
+   - Real-time interval power (`±5%` target window) and cadence (`±5 RPM` target window) compliance scoring (`0..100%`).
+   - Interval completion summaries (`IntervalCompletionSummary`) reporting power compliance, cadence compliance, weighted overall compliance, average power, target power, and segment duration.
+4. **Pluggable Backend Lifecycle Hooks (`VeloCoreBackendHook`)**
+   - Register custom hooks via `veloCoreEngine.registerHook(hook)` to run external application logic on `onTick`, `onIntervalComplete`, `onRideStateChange`, and `onSessionReset` without coupling application state into the core telemetry engine.
+5. **Strava & Garmin Connect `.FIT` / `.TCX` Activity Export (`rust/fit.rs`)**
+   - Binary Garmin `.FIT` encoder writing `file_id`, `device_info`, `event` (Timer Start/Stop), `record`, `lap`, `session`, and `activity` messages with verified 14-byte header and 2-byte trailing CRC-16 checksums.
+   - Universal workout parser/serializer supporting `.txt` libraries, Zwift `.zwo`, `.erg`, `.mrc`, and Garmin `.tcx`.
 
 ---
 
@@ -27,35 +30,117 @@ It is designed both as a standalone indoor training cockpit and as a **plug-and-
 
 ```text
 open-velo-core/
-├── velocore-core/             # Modular Rust crate compiled to WebAssembly
-│   ├── Cargo.toml
-│   └── src/
-│       ├── lib.rs             # WASM FFI exports & shared linear memory buffers
-│       ├── protocol.rs        # ANT+ & BLE frame codecs, checksums & rollover math
-│       ├── physiology.rs      # Skiba W'bal & time-windowed 3s/10s/30s power smoothing
-│       ├── game.rs            # Newspaper Delivery compliance curves, tiers & coin scoring
-│       ├── session.rs         # Stateful 1Hz & sub-second ride session state machine
-│       └── fit.rs             # Binary Garmin .FIT activity encoder & CRC-16
-├── src/
-│   ├── wasm/
-│   │   └── wasmBinary.ts      # Zero-copy WebAssembly loader & typed runtime wrapper
-│   ├── sdk/
-│   │   ├── VeloCoreEngine.ts  # Headless pub/sub engine & WebUSB hardware driver
-│   │   ├── workouts.ts        # .txt workout/profile parser & .ZWO/.ERG/.MRC/.TCX codecs
-│   │   └── types.ts           # Telemetry, workout, and game compliance TypeScript types
-│   ├── components/            # React Cockpit, Workout Library, and Hardware modal
-│   └── App.tsx
+├── Cargo.toml                 # Top-level Rust crate (name = "open-velo-core")
+├── rust/                      # Modular Rust source code compiled to WebAssembly
+│   ├── lib.rs                 # WASM FFI exports & shared linear memory buffers
+│   ├── protocol.rs            # ANT+ & BLE frame codecs, checksums & rollover math
+│   ├── physiology.rs          # Skiba W'bal & time-windowed 3s/10s/30s power smoothing
+│   ├── compliance.rs          # Structured workout power & cadence compliance evaluation
+│   ├── session.rs             # Stateful 1Hz & sub-second ride session state machine
+│   └── fit.rs                 # Binary Garmin .FIT activity encoder & CRC-16
+├── src/                       # Headless TypeScript SDK (framework-agnostic)
+│   ├── index.ts               # Public package entrypoint & barrel exports
+│   ├── VeloCoreEngine.ts      # Stateful pub/sub engine, lifecycle hooks & WebUSB driver
+│   ├── types.ts               # Telemetry, workout, and backend hook TypeScript interfaces
+│   ├── workouts.ts            # .txt workout/profile persistence & .ZWO/.ERG/.MRC/.TCX codecs
+│   └── wasm/
+│       ├── wasmBinary.ts      # Zero-copy WebAssembly runtime wrapper
+│       └── embeddedWasm.ts    # Auto-generated Base64-embedded open_velo_core.wasm binary
+├── scripts/
+│   └── embed-wasm.mjs         # Embeds compiled WASM into src/wasm/embeddedWasm.ts
 ├── public/
-│   ├── velocore_core.wasm     # Compiled Rust WebAssembly binary
-│   ├── workouts.txt           # Human-editable workout library
-│   └── rider-profile.txt      # Persistent rider FTP & mass (kg)
+│   ├── workouts.txt           # Default human-editable workout library fixture
+│   └── rider-profile.txt      # Default rider FTP & mass (kg) fixture
 └── tests/
     └── wasm-engine.test.ts    # End-to-end Node + WASM integration test suite
 ```
 
 ---
 
-## Getting Started
+## Installing & Using `open-velo-core`
+
+### 1. Link the Package
+
+In your frontend repository's `package.json`:
+
+```json
+{
+  "dependencies": {
+    "open-velo-core": "file:../open-velo-core"
+  }
+}
+```
+
+### 2. Subscribe to Telemetry & Register Backend Hooks
+
+```ts
+import {
+  veloCoreEngine,
+  BUILTIN_WORKOUTS,
+  type TelemetrySnapshot,
+  type IntervalCompletionSummary,
+} from 'open-velo-core';
+
+// 1. Initialize the embedded Rust/WASM runtime and 1Hz session clock
+await veloCoreEngine.start();
+
+// 2. Load a workout and configure rider profile
+veloCoreEngine.selectWorkout(BUILTIN_WORKOUTS[0]);
+veloCoreEngine.setFtpWatts(280);
+veloCoreEngine.setRiderWeightKg(72);
+
+// 3. Subscribe to real-time telemetry snapshots
+const unsubscribeTelemetry = veloCoreEngine.subscribeTelemetry((snap: TelemetrySnapshot) => {
+  console.log({
+    instantWatts: snap.instantPowerWatts,
+    power3sWatts: snap.power3sWatts,
+    targetWatts: snap.targetPowerWatts,
+    intervalProgress01: snap.intervalProgress01,
+    compliancePct: snap.intervalCompliancePct,
+    wBalPct: snap.wPrimeBalancePct,
+  });
+});
+
+// 4. Attach custom application logic via pluggable Backend Hooks
+const unregisterHook = veloCoreEngine.registerHook({
+  id: 'custom-analytics-hook',
+  onTick: (snap: TelemetrySnapshot) => {
+    // Invoked every 1Hz tick while the ride clock is active
+  },
+  onIntervalComplete: (summary: IntervalCompletionSummary) => {
+    console.log(
+      `Interval #${summary.intervalIndex + 1} (${summary.segmentName}) | ` +
+        `Compliance: ${summary.overallCompliancePct}% | ` +
+        `Avg Power: ${summary.averagePowerWatts}W / ${summary.targetPowerWatts}W`
+    );
+  },
+  onRideStateChange: (isRiding: boolean) => {
+    console.log(`Ride active: ${isRiding}`);
+  },
+  onSessionReset: () => {
+    console.log('Session reset');
+  },
+});
+
+// 5. Pair a physical USB ANT+ dongle (WebUSB) and control the smart trainer
+await veloCoreEngine.connectWebUsbAntDongle();
+veloCoreEngine.setTrainerControlMode('ERG');
+```
+
+### 3. Public SDK API Summary (`src/index.ts`)
+
+| Category | Methods / Exports |
+| :--- | :--- |
+| **Lifecycle & Hooks** | `veloCoreEngine.start()`, `stop()`, `registerHook(hook)`, `subscribeTelemetry(cb)`, `subscribeIntervalCompletions(cb)`, `subscribeDevices(cb)`, `subscribeFrames(cb)` |
+| **Ride & Workout Controls** | `toggleRidePause()`, `resetSession()`, `skipToSegment(idx)`, `selectWorkout(workout)`, `getActiveWorkout()` |
+| **Smart Trainer Control** | `setTrainerControlMode('ERG' \| 'SLOPE' \| 'RESISTANCE')`, `setManualErgWatts(w)`, `setSlopeGradePct(pct)`, `setTargetResistancePct(pct)`, `setIntensityBiasPct(pct)` |
+| **Rider Profile** | `setFtpWatts(w)`, `setRiderWeightKg(kg)`, `loadRiderProfileFromTxtFile()`, `saveRiderProfileToTxtFile(profile)` |
+| **Workouts & Activity Export** | `BUILTIN_WORKOUTS`, `parseUniversalWorkout(text, ftp)`, `loadWorkoutsFromTxtFile(ftp)`, `saveWorkoutsToTxtFile(list)`, `encodeTelemetryToFitBinary(history)`, `encodeTelemetryToTcxXml(title, history)` |
+| **Hardware & Debug** | `connectWebUsbAntDongle()`, `updateSyntheticConfig(patch)`, `injectCustomHexFrame(hex, protocol)` |
+
+---
+
+## Development, Building & Testing
 
 ### Prerequisites
 
@@ -65,29 +150,22 @@ open-velo-core/
   rustup target add wasm32-unknown-unknown
   ```
 
-### Installation & Development Server
+### Scripts
 
 ```bash
 # Install dependencies
 npm install
 
-# Start the local development server on http://localhost:3000
-npm run dev
-```
-
-### Building the Rust WebAssembly Core & Running Tests
-
-```bash
-# Compile velocore-core to public/velocore_core.wasm
+# Compile Rust to WebAssembly and embed into src/wasm/embeddedWasm.ts
 npm run build:wasm
 
-# Run Rust unit tests + WASM build + TypeScript/WASM integration tests
+# Run all 9 Rust unit tests + WASM build + 7 TypeScript/WASM integration tests
 npm test
 
-# Type-check TypeScript
+# Type-check TypeScript sources
 npm run lint
 
-# Build production bundle
+# Build WASM + verify TypeScript compilation
 npm run build
 ```
 
@@ -95,21 +173,15 @@ npm run build
 
 ## Current Limitations
 
-- **Bluetooth Low Energy (BLE) Hardware Not Supported Yet**: While the Rust core (`protocol.rs`) includes packet decoders/encoders for BLE FTMS (`0x1826`), Cycling Power (`0x1818`), and Heart Rate (`0x180D`), end-to-end physical Bluetooth connectivity via Web Bluetooth is not yet supported. Hardware pairing currently targets **USB ANT+ sticks** (Garmin / Dynastream `0x0FCF:0x1008` / `0x1009`).
-- **Browser WebUSB Support**: Direct USB ANT+ dongle access requires a Chromium-based browser (Chrome, Edge, Brave) supporting the WebUSB API. On Linux, udev rules granting user read/write permissions to USB vendor `0x0fcf` are required.
-- **Single-Lap `.FIT` Summaries**: Activity exports currently record a single continuous session/lap summary per exported `.FIT` file rather than splitting each workout interval into separate `.FIT` lap messages.
-- **Local Dev Server Persistence**: Saving new workouts and rider metrics writes directly to `public/workouts.txt` and `public/rider-profile.txt` via the Vite dev server middleware (with `localStorage` fallback when hosted statically).
+- **Bluetooth Low Energy (BLE) Hardware Not Supported Yet**: While `rust/protocol.rs` includes packet decoders and encoders for BLE FTMS (`0x1826`), Cycling Power (`0x1818`), and Heart Rate (`0x180D`), end-to-end physical Bluetooth hardware pairing via Web Bluetooth is not yet supported. Physical sensor/trainer pairing currently targets **USB ANT+ sticks** (Garmin / Dynastream `0x0FCF:0x1008` / `0x1009`).
+- **Browser WebUSB Requirements**: Direct USB ANT+ access requires a Chromium-based browser (Chrome, Edge, Brave) supporting the WebUSB API. On Linux, udev rules granting user read/write access to USB vendor `0x0fcf` are required.
+- **Single-Lap `.FIT` Summaries**: Activity exports currently emit a single continuous session/lap summary per exported `.FIT` file rather than splitting each workout interval into separate `.FIT` lap messages.
 
 ---
 
 ## Roadmap
 
-- [ ] **Bluetooth Low Energy (BLE) Hardware Support**: Complete end-to-end Web Bluetooth pairing, GATT notification subscriptions, and FTMS (`0x2AD9`) smart trainer control for BLE-only trainers, power meters, and heart rate straps.
-- [ ] **EarthBound / Stardew Valley Newspaper Delivery Game Frontend**:
-  - 2D pixel-art neighborhood canvas subscribing to `veloCoreEngine.subscribeTelemetry()`.
-  - Map each workout interval to a house/block along the paper route, using real-time speed (`speedKph`) to scroll the rider down the street.
-  - Trigger newspaper throw animations at the end of each interval using `lastCompletedIntervalTier` (`Gold Mailbox`, `Silver Porch`, `Bronze Lawn`, `Broken Window`) and `totalCoinsEarned`.
-  - Town hub, bike shop upgrades, and neighborhood route progression unlocked with delivery tips/coins.
-- [ ] **Multi-Lap `.FIT` Interval Markers**: Emit a `.FIT` `lap` message automatically at each workout interval transition so Strava and Garmin Connect display per-interval splits alongside game delivery tiers.
-- [ ] **Heart Rate Zone & Cadence Target Compliance**: Expand interval definitions in `public/workouts.txt` to include optional target cadence and heart rate caps that factor into game delivery bonuses.
-- [ ] **Desktop Packaging (Tauri)**: Package `velocore-core` and the frontend as a native cross-platform desktop app with native USB/BLE permissions out of the box.
+- [ ] **Bluetooth Low Energy (BLE) Hardware Support**: Complete end-to-end Web Bluetooth pairing, GATT notification subscriptions, and FTMS (`0x2AD9`) smart trainer control for BLE-only trainers, power meters, and heart rate monitors.
+- [ ] **Multi-Lap `.FIT` Interval Markers**: Automatically emit `.FIT` `lap` messages on interval transitions so Strava and Garmin Connect display per-interval splits.
+- [ ] **Heart Rate Zone & Cadence Target Compliance**: Expand interval definitions to support optional target cadence and heart rate caps in compliance evaluation.
+- [ ] **Expanded Hook Middleware**: Add pre-command trainer hooks and custom sensor stream filters.

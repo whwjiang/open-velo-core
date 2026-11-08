@@ -1,16 +1,17 @@
 /**
- * VeloCore Native WebAssembly Binary Loader & Zero-Copy Memory Bridge
+ * Open VeloCore Native WebAssembly Binary Loader & Zero-Copy Memory Bridge
  *
- * Loads the compiled `velocore_core.wasm` Rust binary (from `/velocore_core.wasm`
- * in the browser or `public/velocore_core.wasm` in Node test runners, with an embedded
- * fallback binary if needed) and exposes zero-copy typed methods for:
+ * Instantiates the self-contained `open_velo_core.wasm` Rust binary (embedded directly into
+ * the SDK bundle via `embeddedWasm.ts` so any browser or Node consumer runs with zero external
+ * `.wasm` asset configuration) and exposes zero-copy typed methods for:
  * - ANT+ & BLE packet decoding and outbound FE-C / FTMS command encoding
  * - Stateful 3s/10s/30s time-windowed power smoothing & Skiba W'bal integration
- * - Newspaper Delivery Game interval compliance & reward scoring
+ * - Structured workout target power & cadence compliance evaluation
  * - Binary Garmin `.FIT` activity file encoding & CRC-16 computation
  */
 
-import { TelemetryHistoryPoint } from '../sdk/types';
+import { TelemetryHistoryPoint } from '../types';
+import { decodeEmbeddedWasmBytes } from './embeddedWasm';
 
 export interface VeloCoreWasmExports {
   memory: WebAssembly.Memory;
@@ -45,10 +46,9 @@ export interface VeloCoreWasmExports {
   encode_ble_ftms_resistance?: (resistancePct: number) => number;
   encode_ble_ftms_slope?: (slopeHundredths: number, crrByte: number, cwByte: number) => number;
 
-  // Stateful Session & Game Compliance Scorer
+  // Stateful Session & Target Compliance Scorer
   compute_power_compliance_score?: (actualWatts: number, targetWatts: number) => number;
   compute_cadence_compliance_score?: (actualRpm: number, targetRpm: number) => number;
-  classify_delivery_tier?: (compliancePct: number) => number;
   session_reset?: () => void;
   session_set_rider_profile?: (
     ftpWatts: number,
@@ -71,9 +71,7 @@ export interface VeloCoreWasmExports {
   session_get_interval_power?: (fallback: number) => number;
   session_get_interval_compliance_pct?: () => number;
   session_get_interval_cadence_compliance_pct?: () => number;
-  session_get_last_interval_tier?: () => number;
-  session_get_last_interval_coins?: () => number;
-  session_get_total_coins?: () => number;
+  session_get_last_interval_duration_sec?: () => number;
 
   // Binary .FIT Activity Encoder
   fit_crc16?: (ptr: number, len: number) => number;
@@ -272,20 +270,12 @@ export class VeloCoreWasmRuntime {
 
     let wasmBytes: Uint8Array | null = customWasmBytes ?? null;
 
-    if (!wasmBytes && typeof fetch === 'function') {
-      try {
-        const res = await fetch('/velocore_core.wasm');
-        if (res.ok) {
-          const buf = await res.arrayBuffer();
-          wasmBytes = new Uint8Array(buf);
-        }
-      } catch {
-        // Fallback to embedded WASM binary
-      }
-    }
-
     if (!wasmBytes) {
-      wasmBytes = buildFallbackWasmBinaryBytes();
+      try {
+        wasmBytes = decodeEmbeddedWasmBytes();
+      } catch {
+        wasmBytes = buildFallbackWasmBinaryBytes();
+      }
     }
 
     const res = await WebAssembly.instantiate(
@@ -560,7 +550,7 @@ export class VeloCoreWasmRuntime {
   }
 
   // ==========================================================================
-  // Stateful Rust Session & Newspaper Delivery Game Compliance Bridge
+  // Stateful Rust Session & Interval Target Compliance Bridge
   // ==========================================================================
 
   sessionReset(): void {
@@ -603,17 +593,21 @@ export class VeloCoreWasmRuntime {
   }
 
   sessionCompleteInterval(): {
-    compliancePct: number;
-    deliveryTier: 0 | 1 | 2 | 3;
-    coinsEarned: number;
-    totalCoins: number;
+    powerCompliancePct: number;
+    cadenceCompliancePct: number;
+    overallCompliancePct: number;
+    durationSec: number;
   } {
-    const compliancePct = this.exports?.session_complete_interval?.() ?? 100;
-    const rawTier = this.exports?.session_get_last_interval_tier?.() ?? 3;
-    const deliveryTier = Math.max(0, Math.min(3, rawTier)) as 0 | 1 | 2 | 3;
-    const coinsEarned = this.exports?.session_get_last_interval_coins?.() ?? 50;
-    const totalCoins = this.exports?.session_get_total_coins?.() ?? coinsEarned;
-    return { compliancePct, deliveryTier, coinsEarned, totalCoins };
+    const powerCompliancePct = this.sessionGetIntervalCompliancePct();
+    const cadenceCompliancePct = this.sessionGetIntervalCadenceCompliancePct();
+    const overallCompliancePct = this.exports?.session_complete_interval?.() ?? 100;
+    const durationSec = this.exports?.session_get_last_interval_duration_sec?.() ?? 0;
+    return {
+      powerCompliancePct,
+      cadenceCompliancePct,
+      overallCompliancePct,
+      durationSec,
+    };
   }
 
   sessionGetIntervalCompliancePct(): number {
@@ -622,10 +616,6 @@ export class VeloCoreWasmRuntime {
 
   sessionGetIntervalCadenceCompliancePct(): number {
     return this.exports?.session_get_interval_cadence_compliance_pct?.() ?? 100;
-  }
-
-  sessionGetTotalCoins(): number {
-    return this.exports?.session_get_total_coins?.() ?? 0;
   }
 
   /**

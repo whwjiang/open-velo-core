@@ -2,32 +2,28 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { VeloCoreWasmRuntime } from '../src/wasm/wasmBinary';
 import {
+  VeloCoreEngine,
+  VeloCoreWasmRuntime,
   encodeTelemetryToFitBinary,
   encodeTelemetryToTcxXml,
   parseRiderProfileFromTxt,
   parseWorkoutsLibraryFromTxt,
   serializeRiderProfileToTxt,
   serializeWorkoutsLibraryToTxt,
-} from '../src/sdk/workouts';
+} from '../src/index';
 
-const wasmPath = path.resolve(process.cwd(), 'public', 'velocore_core.wasm');
-
-test('VeloCoreWasmRuntime loads compiled Rust WASM binary (velocore_core.wasm)', async () => {
-  assert.ok(fs.existsSync(wasmPath), 'Expected public/velocore_core.wasm to exist');
-  const wasmBytes = new Uint8Array(fs.readFileSync(wasmPath));
+test('VeloCoreWasmRuntime loads self-contained embedded Rust WASM binary (open_velo_core.wasm)', async () => {
   const runtime = new VeloCoreWasmRuntime();
-  await runtime.init(wasmBytes);
+  await runtime.init();
 
   assert.equal(runtime.isReady, true);
   assert.equal(runtime.hasFullRustCore, true);
 });
 
 test('Rust WASM encodes & verifies ANT+ FE-C and BLE FTMS smart trainer control packets', async () => {
-  const wasmBytes = new Uint8Array(fs.readFileSync(wasmPath));
   const runtime = new VeloCoreWasmRuntime();
-  await runtime.init(wasmBytes);
+  await runtime.init();
 
   // 1. ANT+ FE-C Page 49 ERG target power (280W = 1120 * 0.25W = 0x0460)
   const ergFrame = runtime.encodeAntFecErg(0, 280);
@@ -53,9 +49,8 @@ test('Rust WASM encodes & verifies ANT+ FE-C and BLE FTMS smart trainer control 
 });
 
 test('Rust WASM decodes inbound ANT+ FE-C (0x19/0x10) and BLE GATT (0x2AD2/0x2A37) packets', async () => {
-  const wasmBytes = new Uint8Array(fs.readFileSync(wasmPath));
   const runtime = new VeloCoreWasmRuntime();
-  await runtime.init(wasmBytes);
+  await runtime.init();
   runtime.sessionReset();
 
   // ANT+ FE-C Page 0x19: 310W, 95 RPM
@@ -79,10 +74,9 @@ test('Rust WASM decodes inbound ANT+ FE-C (0x19/0x10) and BLE GATT (0x2AD2/0x2A3
   assert.equal(decodedHrm.heartRateBpm, 162);
 });
 
-test('Rust WASM session engine computes 3s/10s power windows, Wbal, and Newspaper Delivery Game compliance', async () => {
-  const wasmBytes = new Uint8Array(fs.readFileSync(wasmPath));
+test('Rust WASM session engine computes 3s/10s power windows, Wbal, and interval target compliance', async () => {
   const runtime = new VeloCoreWasmRuntime();
-  await runtime.init(wasmBytes);
+  await runtime.init();
   runtime.sessionReset();
   runtime.sessionSetRiderProfile(280, 72, 22000);
 
@@ -92,24 +86,48 @@ test('Rust WASM session engine computes 3s/10s power windows, Wbal, and Newspape
   }
   assert.equal(runtime.sessionGetWindowPowerAvg(3000, 3750, 0), 260);
 
-  // Simulate 30 seconds of riding a 260W @ 90 RPM interval (House #1 delivery route)
+  // Simulate 30 seconds of riding a 260W @ 90 RPM interval
   for (let s = 0; s < 30; s++) {
     runtime.sessionTick1Hz(262, 152, 91, 33.5, 260, 90);
   }
   assert.equal(runtime.sessionGetIntervalCompliancePct(), 100);
   assert.equal(runtime.sessionGetIntervalCadenceCompliancePct(), 100);
 
-  const report = runtime.sessionCompleteInterval();
-  assert.equal(report.compliancePct, 100);
-  assert.equal(report.deliveryTier, 3); // Gold Mailbox Bullseye
-  assert.equal(report.coinsEarned, 100);
-  assert.equal(runtime.sessionGetTotalCoins(), 100);
+  const summary = runtime.sessionCompleteInterval();
+  assert.equal(summary.powerCompliancePct, 100);
+  assert.equal(summary.cadenceCompliancePct, 100);
+  assert.equal(summary.overallCompliancePct, 100);
+  assert.equal(summary.durationSec, 30);
+});
+
+test('VeloCoreEngine supports pluggable backend lifecycle hooks (registerHook)', () => {
+  const engine = new VeloCoreEngine();
+  let rideStateChanges = 0;
+  let resets = 0;
+
+  const unregister = engine.registerHook({
+    id: 'custom-consumer-hook',
+    onRideStateChange: () => {
+      rideStateChanges += 1;
+    },
+    onSessionReset: () => {
+      resets += 1;
+    },
+  });
+
+  engine.toggleRidePause();
+  engine.resetSession();
+  assert.equal(rideStateChanges, 1);
+  assert.equal(resets, 1);
+
+  unregister();
+  engine.toggleRidePause();
+  assert.equal(rideStateChanges, 1);
 });
 
 test('Rust WASM & TypeScript .FIT encoders produce valid Garmin .FIT activity files with verified CRCs', async () => {
-  const wasmBytes = new Uint8Array(fs.readFileSync(wasmPath));
   const runtime = new VeloCoreWasmRuntime();
-  await runtime.init(wasmBytes);
+  await runtime.init();
 
   const nowMs = Date.now();
   const history = Array.from({ length: 15 }, (_, idx) => ({
@@ -143,7 +161,7 @@ test('Rust WASM & TypeScript .FIT encoders produce valid Garmin .FIT activity fi
   assert.equal(tsFitBytes[0], 14);
   assert.equal(new TextDecoder().decode(tsFitBytes.subarray(8, 12)), '.FIT');
 
-  const tcxXml = encodeTelemetryToTcxXml('Paperboy Route 1', history);
+  const tcxXml = encodeTelemetryToTcxXml('Threshold Progression', history);
   assert.ok(tcxXml.includes('<TrainingCenterDatabase'));
   assert.ok(tcxXml.includes('<Watts>'));
 });
