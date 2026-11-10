@@ -8,6 +8,7 @@
 //! - [`fit`]: Standards-compliant Garmin `.FIT` binary activity file encoder & CRC-16
 
 pub mod compliance;
+pub mod controller;
 pub mod fit;
 pub mod physiology;
 pub mod protocol;
@@ -339,6 +340,20 @@ pub extern "C" fn session_get_interval_cadence_compliance_pct() -> u32 {
 #[no_mangle]
 pub extern "C" fn session_get_last_interval_duration_sec() -> u32 {
     SESSION.with(|s| s.borrow().last_completed_interval_duration_sec)
+}
+
+#[no_mangle]
+pub extern "C" fn compute_virtual_gear_ratio_thousandths(gear: u8) -> u32 {
+    controller::compute_virtual_gear_ratio_thousandths(gear)
+}
+
+#[no_mangle]
+pub extern "C" fn decode_ble_controller_in_buf(len: usize) -> u32 {
+    if len == 0 || len > INBOUND_BUF_LEN {
+        return 0;
+    }
+    let frame: [u8; INBOUND_BUF_LEN] = INBOUND_FRAME_BUF.with(|b| *b.borrow());
+    controller::decode_ble_controller_button_mask(&frame[0..len]) as u32
 }
 
 // ============================================================================

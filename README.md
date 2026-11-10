@@ -34,6 +34,7 @@ open-velo-core/
 ├── rust/                      # Modular Rust source code compiled to WebAssembly
 │   ├── lib.rs                 # WASM FFI exports & shared linear memory buffers
 │   ├── protocol.rs            # ANT+ & BLE frame codecs, checksums & rollover math
+│   ├── controller.rs          # OpenBikeControl / Zwift Click decoder & virtual gear math
 │   ├── physiology.rs          # Skiba W'bal & time-windowed 3s/10s/30s power smoothing
 │   ├── compliance.rs          # Structured workout power & cadence compliance evaluation
 │   ├── session.rs             # Stateful 1Hz & sub-second ride session state machine
@@ -117,6 +118,12 @@ const unregisterHook = veloCoreEngine.registerHook({
   onRideStateChange: (isRiding: boolean) => {
     console.log(`Ride active: ${isRiding}`);
   },
+  onControllerInput: (event) => {
+    // Intercept handlebar controller buttons (e.g. OpenBikeControl / Zwift Play)
+    if (event.control === 'BUTTON_A' && event.state === 'PRESSED') {
+      return { preventDefault: true };
+    }
+  },
   onSessionReset: () => {
     console.log('Session reset');
   },
@@ -133,7 +140,8 @@ veloCoreEngine.setTrainerControlMode('ERG');
 | :--- | :--- |
 | **Lifecycle & Hooks** | `veloCoreEngine.start()`, `stop()`, `registerHook(hook)`, `subscribeTelemetry(cb)`, `subscribeIntervalCompletions(cb)`, `subscribeDevices(cb)`, `subscribeFrames(cb)` |
 | **Ride & Workout Controls** | `toggleRidePause()`, `resetSession()`, `skipToSegment(idx)`, `selectWorkout(workout)`, `getActiveWorkout()` |
-| **Smart Trainer Control** | `setTrainerControlMode('ERG' \| 'SLOPE' \| 'RESISTANCE')`, `setManualErgWatts(w)`, `setSlopeGradePct(pct)`, `setTargetResistancePct(pct)`, `setIntensityBiasPct(pct)` |
+| **Smart Trainer Control** | `setTrainerControlMode('ERG' \| 'SLOPE' \| 'RESISTANCE')`, `setManualErgWatts(w)`, `setSlopeGradePct(pct)`, `setTargetResistancePct(pct)`, `setIntensityBiasPct(pct)`, `setVirtualGear(1..24)` |
+| **Handlebar Controllers (OpenBikeControl)** | `ingestControllerEvent(evt)`, `ingestBleControllerNotification(id, bytes, model)`, `subscribeControllerEvents(cb)` |
 | **Rider Profile** | `setFtpWatts(w)`, `setRiderWeightKg(kg)`, `loadRiderProfileFromTxtFile()`, `saveRiderProfileToTxtFile(profile)` |
 | **Workouts & Activity Export** | `BUILTIN_WORKOUTS`, `parseUniversalWorkout(text, ftp)`, `loadWorkoutsFromTxtFile(ftp)`, `saveWorkoutsToTxtFile(list)`, `encodeTelemetryToFitBinary(history)`, `encodeTelemetryToTcxXml(title, history)` |
 | **Hardware & Debug** | `connectWebUsbAntDongle()`, `updateSyntheticConfig(patch)`, `injectCustomHexFrame(hex, protocol)` |

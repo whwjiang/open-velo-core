@@ -72,6 +72,22 @@ test('Rust WASM decodes inbound ANT+ FE-C (0x19/0x10) and BLE GATT (0x2AD2/0x2A3
   assert.ok(decodedHrm);
   assert.equal(decodedHrm.hrUpdated, true);
   assert.equal(decodedHrm.heartRateBpm, 162);
+
+  // BLE FTMS 0x2AD2 with Total Distance (0x0010) + Inst Cadence (0x0004) + Inst Power (0x0040) + HR (0x0200) -> flags = 0x0254
+  const bleFtmsWithDistAndHr = new Uint8Array([
+    0x54, 0x02, // flags = 0x0254 (Speed present, Cadence present, Total Dist 3B present, Power present, HR present)
+    0xd4, 0x0d, // Speed: 3540 -> 35.4 km/h
+    180, 0x00,  // Cadence: 180 * 0.5 = 90 RPM
+    0x10, 0x27, 0x00, // Total Distance (uint24 = 10000m)
+    0x18, 0x01, // Instantaneous Power: 280 W
+    158,        // Heart Rate: 158 BPM
+  ]);
+  const decodedFtms = runtime.decodeBleFrame(0x2ad2, bleFtmsWithDistAndHr);
+  assert.ok(decodedFtms);
+  assert.equal(decodedFtms.speedKph, 35.4);
+  assert.equal(decodedFtms.cadenceRpm, 90);
+  assert.equal(decodedFtms.powerWatts, 280);
+  assert.equal(decodedFtms.heartRateBpm, 158);
 });
 
 test('Rust WASM session engine computes 3s/10s power windows, Wbal, and interval target compliance', async () => {
@@ -123,6 +139,70 @@ test('VeloCoreEngine supports pluggable backend lifecycle hooks (registerHook)',
   unregister();
   engine.toggleRidePause();
   assert.equal(rideStateChanges, 1);
+});
+
+test('OpenBikeControl / Zwift Click controller routing, virtual shifting, and hook interception', async () => {
+  const engine = new VeloCoreEngine();
+  await engine.start();
+
+  // 1. Default ERG mode behavior: SHIFT_UP increments intensityBiasPct (100% -> 101%)
+  engine.setTrainerControlMode('ERG');
+  const ergRes = engine.ingestControllerEvent({
+    deviceId: 'zwift-click-1',
+    deviceModel: 'ZWIFT_CLICK',
+    control: 'SHIFT_UP',
+    state: 'PRESSED',
+    value: 1,
+  });
+  assert.equal(ergRes.handledByHook, false);
+  assert.equal(ergRes.snapshot.intensityBiasPct, 101);
+
+  // 2. Default SLOPE mode behavior: SHIFT_UP increments virtualGear (12 -> 13)
+  engine.setTrainerControlMode('SLOPE');
+  const slopeRes = engine.ingestControllerEvent({
+    deviceId: 'zwift-click-1',
+    deviceModel: 'ZWIFT_CLICK',
+    control: 'SHIFT_UP',
+    state: 'PRESSED',
+    value: 1,
+  });
+  assert.equal(slopeRes.snapshot.virtualGear, 13);
+  assert.ok(slopeRes.snapshot.virtualGearRatio > 1.0);
+
+  // 3. Raw BLE Zwift Click packet ([0x37, 0x08, 0x00, 0x10, 0x00] = SHIFT_UP pressed -> Gear 14)
+  const emitted = engine.ingestBleControllerNotification(
+    'zwift-click-ble',
+    new Uint8Array([0x37, 0x08, 0x00, 0x10, 0x00]),
+    'ZWIFT_CLICK'
+  );
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].control, 'SHIFT_UP');
+  assert.equal(engine.getVirtualGear(), 14);
+
+  // 4. Hook interception: frontend intercepts BUTTON_A and SHIFT_UP with { preventDefault: true }
+  const interceptedControls: string[] = [];
+  const unregister = engine.registerHook({
+    id: 'controller-interceptor',
+    onControllerInput: (evt) => {
+      interceptedControls.push(evt.control);
+      return { preventDefault: true };
+    },
+  });
+
+  const hookedRes = engine.ingestControllerEvent({
+    deviceId: 'zwift-play-r',
+    deviceModel: 'ZWIFT_PLAY_RIGHT',
+    control: 'SHIFT_UP',
+    state: 'PRESSED',
+    value: 1,
+  });
+  assert.equal(hookedRes.handledByHook, true);
+  // Virtual gear remains 14 because the hook prevented default shifting
+  assert.equal(engine.getVirtualGear(), 14);
+  assert.deepEqual(interceptedControls, ['SHIFT_UP']);
+
+  unregister();
+  engine.stop();
 });
 
 test('Rust WASM & TypeScript .FIT encoders produce valid Garmin .FIT activity files with verified CRCs', async () => {

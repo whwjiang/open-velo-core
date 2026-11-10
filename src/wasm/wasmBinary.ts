@@ -72,6 +72,8 @@ export interface VeloCoreWasmExports {
   session_get_interval_compliance_pct?: () => number;
   session_get_interval_cadence_compliance_pct?: () => number;
   session_get_last_interval_duration_sec?: () => number;
+  compute_virtual_gear_ratio_thousandths?: (gear: number) => number;
+  decode_ble_controller_in_buf?: (len: number) => number;
 
   // Binary .FIT Activity Encoder
   fit_crc16?: (ptr: number, len: number) => number;
@@ -616,6 +618,23 @@ export class VeloCoreWasmRuntime {
 
   sessionGetIntervalCadenceCompliancePct(): number {
     return this.exports?.session_get_interval_cadence_compliance_pct?.() ?? 100;
+  }
+
+  computeVirtualGearRatio(gear: number): number {
+    const clamped = Math.max(1, Math.min(24, Math.round(gear)));
+    if (this.exports?.compute_virtual_gear_ratio_thousandths) {
+      return Number((this.exports.compute_virtual_gear_ratio_thousandths(clamped) / 1000).toFixed(3));
+    }
+    return Number((1 + (clamped - 12) * 0.055).toFixed(3));
+  }
+
+  decodeBleControllerMask(raw: Uint8Array): number {
+    const mem = this.getMemView();
+    if (!this.exports?.decode_ble_controller_in_buf || !mem || raw.length === 0) return 0;
+    const len = Math.min(raw.length, 128);
+    const inPtr = this.getInboundPtr();
+    mem.set(raw.subarray(0, len), inPtr);
+    return this.exports.decode_ble_controller_in_buf(len);
   }
 
   /**

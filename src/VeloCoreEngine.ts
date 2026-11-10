@@ -1,5 +1,8 @@
 import { VeloCoreWasmRuntime } from './wasm/wasmBinary';
 import {
+  BikeControllerControlId,
+  BikeControllerDeviceModel,
+  BikeControllerEvent,
   ConnectedSensorDevice,
   DecodedByteField,
   IntervalCompletionSummary,
@@ -23,6 +26,7 @@ type TelemetryListener = (snapshot: TelemetrySnapshot) => void;
 type FrameAuditListener = (frames: ProtocolFrameAudit[]) => void;
 type DeviceRosterListener = (devices: ConnectedSensorDevice[]) => void;
 type IntervalCompletionListener = (summary: IntervalCompletionSummary) => void;
+type ControllerEventListener = (event: BikeControllerEvent) => void;
 
 const toHex = (b: number) => b.toString(16).toUpperCase().padStart(2, '0');
 const bytesToHex = (arr: Uint8Array | number[]) =>
@@ -40,6 +44,7 @@ export class VeloCoreEngine {
   private frameListeners = new Set<FrameAuditListener>();
   private deviceListeners = new Set<DeviceRosterListener>();
   private intervalCompletionListeners = new Set<IntervalCompletionListener>();
+  private controllerListeners = new Set<ControllerEventListener>();
   private backendHooks = new Set<VeloCoreBackendHook>();
 
   // Workout & Clock State
@@ -47,8 +52,8 @@ export class VeloCoreEngine {
   private isRiding = false;
   private userPausedManually = false;
   private elapsedSec = 0;
-  private tickTimer: number | null = null;
-  private synthTimer: number | null = null;
+  private tickTimer: ReturnType<typeof setInterval> | null = null;
+  private synthTimer: ReturnType<typeof setInterval> | null = null;
 
   // Rider Profile & Trainer Control
   private ftpWatts = 280;
@@ -60,6 +65,9 @@ export class VeloCoreEngine {
   private targetSlopePct = 2.5;
   private targetResistancePct = 35;
   private intensityBiasPct = 100;
+  private virtualGear = 12;
+  private steeringAngleNormalized = 0;
+  private brakeNormalized = 0;
 
   // Rolling Power & Biometric Accumulators
   private powerRing3s: number[] = [];
@@ -132,6 +140,7 @@ export class VeloCoreEngine {
   private usbInEndpoint = 1;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private bleFtmsControlChar: any = null;
+  private bleWriteQueue: Promise<void> = Promise.resolve();
 
   constructor() {
     this.registerDefaultSimulatedDevices();
@@ -154,11 +163,11 @@ export class VeloCoreEngine {
 
   stop(): void {
     if (this.tickTimer !== null) {
-      window.clearInterval(this.tickTimer);
+      globalThis.clearInterval(this.tickTimer);
       this.tickTimer = null;
     }
     if (this.synthTimer !== null) {
-      window.clearInterval(this.synthTimer);
+      globalThis.clearInterval(this.synthTimer);
       this.synthTimer = null;
     }
   }
@@ -196,11 +205,145 @@ export class VeloCoreEngine {
 
   /**
    * Registers a pluggable backend lifecycle hook (`onTick`, `onIntervalComplete`,
-   * `onRideStateChange`, `onSessionReset`). Returns an unregister function.
+   * `onRideStateChange`, `onSessionReset`, `onControllerInput`). Returns an unregister function.
    */
   registerHook(hook: VeloCoreBackendHook): () => void {
     this.backendHooks.add(hook);
     return () => this.backendHooks.delete(hook);
+  }
+
+  /**
+   * Subscribes to normalized OpenBikeControl / handlebar controller events.
+   */
+  subscribeControllerEvents(cb: ControllerEventListener): () => void {
+    this.controllerListeners.add(cb);
+    return () => this.controllerListeners.delete(cb);
+  }
+
+  /**
+   * Sets the virtual drivetrain gear (`1..24`, default `12`) and dispatches
+   * the gear-adjusted trainer command when in SLOPE or RESISTANCE mode.
+   */
+  setVirtualGear(gear: number): void {
+    this.virtualGear = Math.max(1, Math.min(24, Math.round(gear)));
+    if (this.trainerMode !== 'ERG') {
+      this.dispatchSmartTrainerCommand();
+    }
+    this.emitTelemetry();
+  }
+
+  getVirtualGear(): number {
+    return this.virtualGear;
+  }
+
+  /**
+   * Ingests a normalized OpenBikeControl / handlebar controller event from the frontend.
+   *
+   * 1. Invokes `hook.onControllerInput(event, snapshot)` on all registered backend hooks.
+   * 2. Notifies `subscribeControllerEvents` listeners.
+   * 3. Unless a hook returned `{ preventDefault: true }`, applies default cycling hardware
+   *    actions (virtual gear shifting in SLOPE/RESISTANCE mode, or ±1% intensity bias in ERG mode).
+   */
+  ingestControllerEvent(
+    input: Omit<BikeControllerEvent, 'timestampMs'> & { timestampMs?: number }
+  ): { handledByHook: boolean; snapshot: TelemetrySnapshot } {
+    const event: BikeControllerEvent = {
+      ...input,
+      timestampMs: input.timestampMs ?? Date.now(),
+    };
+
+    const currentSnap = this.getSnapshot();
+    let preventDefault = false;
+
+    for (const hook of this.backendHooks) {
+      const res = hook.onControllerInput?.(event, currentSnap);
+      if (res && res.preventDefault) {
+        preventDefault = true;
+      }
+    }
+
+    for (const cb of this.controllerListeners) {
+      cb(event);
+    }
+
+    if (!preventDefault) {
+      if (event.control === 'STEER_AXIS' && event.state === 'AXIS_CHANGE') {
+        this.steeringAngleNormalized = Number(Math.max(-1, Math.min(1, event.value)).toFixed(3));
+        this.emitTelemetry();
+      } else if (event.control === 'BRAKE_AXIS' && event.state === 'AXIS_CHANGE') {
+        this.brakeNormalized = Number(Math.max(0, Math.min(1, event.value)).toFixed(3));
+        this.emitTelemetry();
+      } else if (
+        (event.control === 'SHIFT_UP' || event.control === 'DPAD_UP') &&
+        event.state === 'PRESSED'
+      ) {
+        if (this.trainerMode === 'ERG') {
+          this.setIntensityBiasPct(this.intensityBiasPct + 1);
+        } else {
+          this.setVirtualGear(this.virtualGear + 1);
+        }
+      } else if (
+        (event.control === 'SHIFT_DOWN' || event.control === 'DPAD_DOWN') &&
+        event.state === 'PRESSED'
+      ) {
+        if (this.trainerMode === 'ERG') {
+          this.setIntensityBiasPct(this.intensityBiasPct - 1);
+        } else {
+          this.setVirtualGear(this.virtualGear - 1);
+        }
+      }
+    }
+
+    return {
+      handledByHook: preventDefault,
+      snapshot: this.getSnapshot(),
+    };
+  }
+
+  /**
+   * Decodes a raw BLE controller notification packet (Zwift Click 0x37, Zwift Play 0x07,
+   * or OpenBikeControl 0xBC frame) in Rust WASM and routes resulting button events
+   * through `ingestControllerEvent()`.
+   */
+  ingestBleControllerNotification(
+    deviceId: string,
+    raw: Uint8Array,
+    deviceModel: BikeControllerDeviceModel = 'GENERIC_OBC'
+  ): BikeControllerEvent[] {
+    const mask = this.wasm.decodeBleControllerMask(raw);
+    if (mask === 0) return [];
+
+    const bitTable: Array<[number, BikeControllerControlId]> = [
+      [1 << 0, 'SHIFT_UP'],
+      [1 << 1, 'SHIFT_DOWN'],
+      [1 << 2, 'DPAD_UP'],
+      [1 << 3, 'DPAD_DOWN'],
+      [1 << 4, 'DPAD_LEFT'],
+      [1 << 5, 'DPAD_RIGHT'],
+      [1 << 6, 'BUTTON_A'],
+      [1 << 7, 'BUTTON_B'],
+      [1 << 8, 'BUTTON_Y'],
+      [1 << 9, 'BUTTON_Z'],
+      [1 << 10, 'ON_OFF_HOME'],
+    ];
+
+    const emitted: BikeControllerEvent[] = [];
+    const now = Date.now();
+    for (const [bit, control] of bitTable) {
+      if ((mask & bit) !== 0) {
+        const evt: BikeControllerEvent = {
+          timestampMs: now,
+          deviceId,
+          deviceModel,
+          control,
+          state: 'PRESSED',
+          value: 1,
+        };
+        this.ingestControllerEvent(evt);
+        emitted.push(evt);
+      }
+    }
+    return emitted;
   }
 
   private emitTelemetry(): void {
@@ -503,45 +646,141 @@ export class VeloCoreEngine {
     if (!nav.bluetooth) {
       const isSecure = window.isSecureContext;
       const isIframe = window.self !== window.top;
-      let reason = 'WebBluetooth is not supported in this browser.';
-      if (!isSecure) {
-        reason = 'WebBluetooth requires a secure context (HTTPS or localhost).';
+      const host = window.location.hostname;
+      const isLinux = /Linux/i.test(navigator.userAgent || '');
+      let reason = 'WebBluetooth is not enabled in this browser.';
+      if (!isSecure || (host !== 'localhost' && host !== '127.0.0.1' && window.location.protocol !== 'https:')) {
+        reason = `WebBluetooth requires a secure origin. Please open http://localhost:${window.location.port || '3000'} (instead of ${host}) or use HTTPS.`;
       } else if (isIframe) {
         reason =
-          'WebBluetooth is blocked inside an embedded preview iframe. Open the app in a standalone tab/window via the top-level URL.';
+          'WebBluetooth is blocked inside an embedded iframe. Open the app directly in a top-level browser tab.';
+      } else if (isLinux) {
+        reason =
+          'On Linux Chrome/Chromium, WebBluetooth is disabled by default. Enable chrome://flags/#enable-experimental-web-platform-features and chrome://flags/#enable-web-bluetooth-new-permissions-backend (or brave://flags/#enable-web-bluetooth in Brave) and relaunch your browser.';
       } else {
         reason =
-          'WebBluetooth is not available. Please use Google Chrome, Edge, or Chromium with Bluetooth turned on in your OS.';
+          'WebBluetooth is not available. Please use Chrome, Edge, or Chromium with Bluetooth turned on in your OS.';
       }
       return {
         ok: false,
-        message: `${reason} Falling back to Synthetic BLE GATT stream.`,
+        message: reason,
       };
     }
 
     const serviceMap = {
-      FTMS: { serviceUuid: 0x1826, charUuid: 0x2ad2, label: 'FTMS Smart Trainer' },
-      CPS: { serviceUuid: 0x1818, charUuid: 0x2a63, label: 'BLE Cycling Power Meter' },
-      HRM: { serviceUuid: 0x180d, charUuid: 0x2a37, label: 'BLE Heart Rate Monitor' },
-      CSCS: { serviceUuid: 0x1816, charUuid: 0x2a5b, label: 'BLE Speed & Cadence Sensor' },
+      FTMS: {
+        filters: [{ services: [0x1826] }, { services: [0x1818] }],
+        serviceUuid: 0x1826,
+        charUuid: 0x2ad2,
+        label: 'FTMS Smart Trainer',
+      },
+      CPS: {
+        filters: [{ services: [0x1818] }],
+        serviceUuid: 0x1818,
+        charUuid: 0x2a63,
+        label: 'BLE Cycling Power Meter',
+      },
+      HRM: {
+        filters: [{ services: [0x180d] }],
+        serviceUuid: 0x180d,
+        charUuid: 0x2a37,
+        label: 'BLE Heart Rate Monitor',
+      },
+      CSCS: {
+        filters: [{ services: [0x1816] }],
+        serviceUuid: 0x1816,
+        charUuid: 0x2a5b,
+        label: 'BLE Speed & Cadence Sensor',
+      },
     }[targetRole];
+
+    let stage = 'Stage 1/5: Browser Device Chooser (navigator.bluetooth.requestDevice)';
+    let selectedDeviceName = 'Unknown Device';
+    let selectedDeviceId = 'N/A';
+    const attemptLogs: string[] = [];
 
     try {
       const device = await nav.bluetooth.requestDevice({
-        filters: [{ services: [serviceMap.serviceUuid] }],
-        optionalServices: [0x1826, 0x1818, 0x180d, 0x1816, 0x180f],
+        filters: serviceMap.filters,
+        optionalServices: [0x1826, 0x1818, 0x180d, 0x1816, 0x180f, 0x180a],
       });
 
-      const server = await device.gatt.connect();
-      const service = await server.getPrimaryService(serviceMap.serviceUuid);
-      const characteristic = await service.getCharacteristic(serviceMap.charUuid);
+      selectedDeviceName = device.name || '(Unnamed BLE Device)';
+      selectedDeviceId = device.id || 'N/A';
+
+      if (!device.gatt) {
+        throw new Error(`Device "${selectedDeviceName}" does not expose a GATT server (device.gatt is null).`);
+      }
+
+      // Stage 2: Connect to GATT server with settling delay & multi-attempt backoff.
+      // On Linux BlueZ, calling gatt.connect() immediately after requestDevice() often fails
+      // with "Connection Error: Connection attempt failed" while BlueZ stops LE discovery.
+      stage = 'Stage 2/5: GATT Server Connect (device.gatt.connect)';
+      await this.delayMs(350);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let server: any = null;
+      const maxAttempts = 4;
+      const backoffMs = [450, 900, 1500, 0];
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          if (device.gatt.connected) {
+            try {
+              device.gatt.disconnect();
+              await this.delayMs(200);
+            } catch {
+              // Ignore disconnect cleanup error
+            }
+          }
+          server = await device.gatt.connect();
+          if (server && device.gatt.connected) {
+            attemptLogs.push(`Attempt ${attempt}/${maxAttempts}: Connected`);
+            break;
+          }
+        } catch (connErr) {
+          const errName = connErr instanceof Error ? connErr.name : 'Error';
+          const errMsg = connErr instanceof Error ? connErr.message : String(connErr);
+          attemptLogs.push(`Attempt ${attempt}/${maxAttempts} failed [${errName}: ${errMsg}]`);
+          if (attempt === maxAttempts) {
+            throw connErr;
+          }
+          await this.delayMs(backoffMs[attempt - 1]);
+        }
+      }
+
+      // Stage 3: Discover Primary GATT Service
+      stage = `Stage 3/5: Discover Primary Service (0x${serviceMap.serviceUuid.toString(16).toUpperCase()})`;
+      await this.delayMs(200);
+      let service;
+      let activeCharUuid = serviceMap.charUuid;
+      try {
+        service = await server.getPrimaryService(serviceMap.serviceUuid);
+      } catch (svcErr) {
+        // Fallback if an FTMS trainer only advertised/exposed 0x1818 Cycling Power
+        if (targetRole === 'FTMS') {
+          try {
+            service = await server.getPrimaryService(0x1818);
+            activeCharUuid = 0x2a63;
+            attemptLogs.push('Fallback: Using 0x1818 Cycling Power service instead of 0x1826 FTMS');
+          } catch {
+            throw svcErr;
+          }
+        } else {
+          throw svcErr;
+        }
+      }
+
+      // Stage 4: Discover Measurement Characteristic
+      stage = `Stage 4/5: Get Characteristic (0x${activeCharUuid.toString(16).toUpperCase()})`;
+      const characteristic = await service.getCharacteristic(activeCharUuid);
 
       const devId = `ble-${targetRole.toLowerCase()}-${device.id || Date.now()}`;
       this.devices.set(devId, {
         id: devId,
         name: device.name || serviceMap.label,
         protocol: 'BLE_GATT',
-        channelOrUuid: `GATT 0x${serviceMap.charUuid.toString(16).toUpperCase()}`,
+        channelOrUuid: `GATT 0x${activeCharUuid.toString(16).toUpperCase()}`,
         type:
           targetRole === 'FTMS'
             ? 'SMART_TRAINER_FEC_FTMS'
@@ -558,11 +797,36 @@ export class VeloCoreEngine {
       });
       this.emitDevices();
 
-      // If FTMS trainer, also grab Fitness Machine Control Point (0x2AD9) and request control (0x00)
-      if (targetRole === 'FTMS') {
+      device.addEventListener('gattserverdisconnected', () => {
+        const d = this.devices.get(devId);
+        if (d) {
+          d.status = 'STALE';
+          this.emitDevices();
+        }
+        if (targetRole === 'FTMS') {
+          this.bleFtmsControlChar = null;
+        }
+      });
+
+      // Stage 5: Subscribe to GATT Notifications
+      stage = `Stage 5/5: Start Notifications (0x${activeCharUuid.toString(16).toUpperCase()})`;
+      await characteristic.startNotifications();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      characteristic.addEventListener('characteristicvaluechanged', (event: any) => {
+        const dv: DataView = event.target.value;
+        const raw = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+        this.ingestBleGattNotification(activeCharUuid, raw, 'BLE_GATT', devId);
+      });
+
+      // If FTMS trainer, grab Fitness Machine Control Point (0x2AD9), enable indications,
+      // send Request Control (0x00) and Start/Resume (0x07), then dispatch initial target.
+      if (targetRole === 'FTMS' && activeCharUuid === 0x2ad2) {
         try {
           this.bleFtmsControlChar = await service.getCharacteristic(0x2ad9);
-          await this.bleFtmsControlChar.writeValue(new Uint8Array([0x00]));
+          await this.bleFtmsControlChar.startNotifications().catch(() => {});
+          this.sendBleFtmsControlRaw(new Uint8Array([0x00])); // Request Control
+          this.sendBleFtmsControlRaw(new Uint8Array([0x07])); // Start / Resume
+          this.dispatchSmartTrainerCommand();
         } catch {
           // Optional control point
         }
@@ -573,31 +837,76 @@ export class VeloCoreEngine {
         this.updateSyntheticConfig({ enabled: false });
       }
 
-      await characteristic.startNotifications();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      characteristic.addEventListener('characteristicvaluechanged', (event: any) => {
-        const dv: DataView = event.target.value;
-        const raw = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
-        this.ingestBleGattNotification(serviceMap.charUuid, raw, 'BLE_GATT', devId);
-      });
-
       return {
         ok: true,
-        message: `Connected to ${device.name || serviceMap.label} over BLE GATT.`,
+        message: `Connected to "${selectedDeviceName}" (ID: ${selectedDeviceId}) over BLE GATT 0x${activeCharUuid.toString(16).toUpperCase()}. [${attemptLogs.join(' · ')}]`,
       };
     } catch (err) {
+      const errName = err instanceof Error ? err.name : 'UnknownError';
       const msg = err instanceof Error ? err.message : String(err);
+      const attemptSummary =
+        attemptLogs.length > 0 ? ` | Attempts: ${attemptLogs.join('; ')}` : '';
+      const deviceContext = `[Role: ${targetRole} · Device: "${selectedDeviceName}" (ID: ${selectedDeviceId}) · Failed at ${stage}]`;
+
+      console.error('[OpenVeloCore WebBluetooth Error]', {
+        role: targetRole,
+        deviceName: selectedDeviceName,
+        deviceId: selectedDeviceId,
+        failedStage: stage,
+        errorName: errName,
+        errorMessage: msg,
+        attempts: attemptLogs,
+        rawError: err,
+      });
+
       if (msg.includes('Permissions-Policy') || msg.includes('SecurityError') || msg.includes('disallowed')) {
         return {
           ok: false,
-          message: `WebBluetooth is blocked by the iframe Permissions Policy. Open the app directly in a full browser tab to pair BLE devices.`,
+          message: `WebBluetooth blocked by Permissions Policy ${deviceContext}: ${errName}: ${msg}. Open the app directly in a top-level browser tab on http://localhost:3000.`,
         };
       }
+
+      if (msg.includes('Connection attempt failed') || msg.includes('Connection Error') || msg.includes('GATT Server is disconnected')) {
+        return {
+          ok: false,
+          message:
+            `WebBluetooth GATT Connection Failed ${deviceContext} — ${errName}: ${msg}${attemptSummary}. ` +
+            `Troubleshooting (Linux / BlueZ): ` +
+            `(1) Do NOT pair the trainer in Linux OS Bluetooth Settings—if it appears in 'bluetoothctl devices', run 'bluetoothctl remove <MAC>' so Chrome can open a clean LE GATT link without OS BR/EDR bond conflicts. ` +
+            `(2) Ensure the trainer is disconnected from phones, bike computers, or other apps (BLE trainers only allow 1 central connection). ` +
+            `(3) Run 'sudo btmgmt le on' or set 'ControllerMode = le' in /etc/bluetooth/main.conf and restart bluetooth.`,
+        };
+      }
+
+      if (msg.includes('User cancelled') || msg.includes('chooser')) {
+        return {
+          ok: false,
+          message: `WebBluetooth pairing canceled at ${stage} (${errName}: ${msg}).`,
+        };
+      }
+
       return {
         ok: false,
-        message: `WebBluetooth pairing canceled or unavailable: ${msg}`,
+        message: `WebBluetooth pairing failed ${deviceContext} — ${errName}: ${msg}${attemptSummary}`,
       };
     }
+  }
+
+  private sendBleFtmsControlRaw(frame: Uint8Array): void {
+    if (!this.bleFtmsControlChar) return;
+    const char = this.bleFtmsControlChar;
+    const copy = new Uint8Array(frame);
+    this.bleWriteQueue = this.bleWriteQueue
+      .then(async () => {
+        if (typeof char.writeValueWithResponse === 'function') {
+          await char.writeValueWithResponse(copy);
+        } else {
+          await char.writeValue(copy);
+        }
+      })
+      .catch(() => {
+        // Ignore transient GATT write contention
+      });
   }
 
   // ============================================================================
@@ -861,7 +1170,46 @@ export class VeloCoreEngine {
     let summary = '';
     const fields: DecodedByteField[] = [];
 
-    if (charUuid === 0x2a63 && raw.length >= 8) {
+    // Decode in Rust WASM first (supports bitmask-driven 0x2AD2 FTMS, 0x2A63 CPS, 0x2A5B CSCS, 0x2A37 HRM)
+    const wasmDecoded = this.wasm.decodeBleFrame(charUuid, raw);
+    if (wasmDecoded && wasmDecoded.valid) {
+      if (wasmDecoded.balanceUpdated) {
+        this.currentLRBalance = wasmDecoded.lrBalancePct;
+      }
+      if (wasmDecoded.cadenceUpdated) {
+        this.currentCadenceRpm = wasmDecoded.cadenceRpm;
+      }
+      if (wasmDecoded.speedUpdated) {
+        this.currentSpeedKph = wasmDecoded.speedKph;
+        this.lastSpeedPacketMs = Date.now();
+      }
+      if (wasmDecoded.hrUpdated && wasmDecoded.heartRateBpm > 30) {
+        this.currentHrBpm = wasmDecoded.heartRateBpm;
+        this.lastHrPacketMs = Date.now();
+        if (wasmDecoded.heartRateBpm > this.maxHrBpm) {
+          this.maxHrBpm = wasmDecoded.heartRateBpm;
+        }
+      }
+      if (wasmDecoded.powerUpdated) {
+        this.recordPowerMeasurement(wasmDecoded.powerWatts);
+      } else {
+        this.emitTelemetry();
+      }
+
+      if (charUuid === 0x2a63) {
+        messageName = 'BLE CPS 0x2A63 (Cycling Power)';
+        summary = `BLE Power · ${this.currentPowerWatts} W · ${this.currentCadenceRpm} RPM · Balance ${this.currentLRBalance}/${100 - this.currentLRBalance}%`;
+      } else if (charUuid === 0x2ad2) {
+        messageName = 'BLE FTMS 0x2AD2 (Indoor Bike Data)';
+        summary = `BLE FTMS · ${this.currentPowerWatts} W · ${this.currentCadenceRpm} RPM · ${this.currentSpeedKph} km/h`;
+      } else if (charUuid === 0x2a5b) {
+        messageName = 'BLE CSCS 0x2A5B (Speed & Cadence)';
+        summary = `BLE CSCS · ${this.currentCadenceRpm} RPM`;
+      } else if (charUuid === 0x2a37) {
+        messageName = 'BLE HRM 0x2A37 (Heart Rate)';
+        summary = `BLE HRM · ${this.currentHrBpm} BPM`;
+      }
+    } else if (charUuid === 0x2a63 && raw.length >= 4) {
       // BLE Cycling Power Measurement (0x2A63)
       // Bytes 0..1: Flags, Bytes 2..3: Instantaneous Power (sint16), Byte 4: Pedal Balance,
       // Bytes 5..6: Cumulative Crank Revolutions (uint16), Bytes 7..8: Last Crank Event Time (1/1024s uint16)
@@ -1141,31 +1489,31 @@ export class VeloCoreEngine {
       bleMsgName = 'BLE FTMS 0x2AD9 (Op 0x05 Set Target Power)';
       cmdSummary = `Set ERG Target Power → ${targetW} W (${targetW * 4} × 0.25W units)`;
     } else if (this.trainerMode === 'RESISTANCE') {
-      antFrame = this.wasm.encodeAntFecResistance(0, this.targetResistancePct);
-      bleFrame = this.wasm.encodeBleFtmsResistance(this.targetResistancePct);
+      const gearRatio = this.wasm.computeVirtualGearRatio(this.virtualGear);
+      const effectiveRes = Math.max(0, Math.min(100, Math.round(this.targetResistancePct * gearRatio)));
+      antFrame = this.wasm.encodeAntFecResistance(0, effectiveRes);
+      bleFrame = this.wasm.encodeBleFtmsResistance(effectiveRes);
       antMsgName = 'ANT+ FE-C Page 48 (0x30 Basic Resistance)';
       bleMsgName = 'BLE FTMS 0x2AD9 (Op 0x04 Set Resistance)';
-      cmdSummary = `Set Brake Resistance → ${this.targetResistancePct}% (${this.targetResistancePct * 2} × 0.5% units)`;
+      cmdSummary = `Set Brake Resistance → ${effectiveRes}% (Gear ${this.virtualGear} · ${gearRatio.toFixed(2)}x)`;
     } else {
-      antFrame = this.wasm.encodeAntFecSlope(0, this.targetSlopePct);
-      bleFrame = this.wasm.encodeBleFtmsSimulation(this.targetSlopePct);
+      const gearRatio = this.wasm.computeVirtualGearRatio(this.virtualGear);
+      const effectiveSlope = Number(
+        Math.max(-20, Math.min(20, this.targetSlopePct + (gearRatio - 1) * 8)).toFixed(2)
+      );
+      antFrame = this.wasm.encodeAntFecSlope(0, effectiveSlope);
+      bleFrame = this.wasm.encodeBleFtmsSimulation(effectiveSlope);
       antMsgName = 'ANT+ FE-C Page 51 (0x33 Track Slope)';
       bleMsgName = 'BLE FTMS 0x2AD9 (Op 0x11 Bike Simulation)';
-      const sign = this.targetSlopePct >= 0 ? '+' : '';
-      cmdSummary = `Set Simulated Grade → ${sign}${this.targetSlopePct.toFixed(1)}% · Crr 0.0040`;
+      const sign = effectiveSlope >= 0 ? '+' : '';
+      cmdSummary = `Set Simulated Grade → ${sign}${effectiveSlope.toFixed(1)}% (Gear ${this.virtualGear})`;
     }
 
     const elapsedUs = Math.max(1, Math.round((performance.now() - t0) * 1000));
 
     // Send over physical WebUSB / WebBluetooth if connected
     this.sendAntUsbRaw(antFrame);
-    if (this.bleFtmsControlChar) {
-      try {
-        this.bleFtmsControlChar.writeValue(bleFrame);
-      } catch {
-        // Ignore transient GATT write failure
-      }
-    }
+    this.sendBleFtmsControlRaw(bleFrame);
 
     // Record both outbound ANT+ FE-C and BLE FTMS frames in the Protocol Inspector
     this.recordFrameAudit({
@@ -1331,13 +1679,13 @@ export class VeloCoreEngine {
 
   private restartSyntheticWireLoop(): void {
     if (this.synthTimer !== null) {
-      window.clearInterval(this.synthTimer);
+      globalThis.clearInterval(this.synthTimer);
       this.synthTimer = null;
     }
     if (!this.synthConfig.enabled) return;
 
     const intervalMs = Math.round(1000 / this.synthConfig.frequencyHz);
-    this.synthTimer = window.setInterval(() => {
+    this.synthTimer = globalThis.setInterval(() => {
       this.emitSyntheticWireBurst();
     }, intervalMs);
   }
@@ -1506,7 +1854,7 @@ export class VeloCoreEngine {
 
   private startWorkoutClock(): void {
     if (this.tickTimer !== null) return;
-    this.tickTimer = window.setInterval(() => {
+    this.tickTimer = globalThis.setInterval(() => {
       // Expire stale individual sensor metrics if synthetic generator is off
       if (!this.synthConfig.enabled) {
         const now = Date.now();
@@ -1829,6 +2177,10 @@ export class VeloCoreEngine {
       targetSlopePct: this.targetSlopePct,
       targetResistancePct: this.targetResistancePct,
       intensityBiasPct: this.intensityBiasPct,
+      virtualGear: this.virtualGear,
+      virtualGearRatio: this.wasm.computeVirtualGearRatio(this.virtualGear),
+      steeringAngleNormalized: this.steeringAngleNormalized,
+      brakeNormalized: this.brakeNormalized,
       intervalCompliancePct: this.wasm.sessionGetIntervalCompliancePct(),
       intervalCadenceCompliancePct: this.wasm.sessionGetIntervalCadenceCompliancePct(),
 

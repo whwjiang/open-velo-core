@@ -6,7 +6,39 @@ export type SensorChannelType =
   | 'SMART_TRAINER_FEC_FTMS'
   | 'CYCLING_POWER'
   | 'HEART_RATE'
-  | 'SPEED_CADENCE';
+  | 'SPEED_CADENCE'
+  | 'BIKE_CONTROLLER';
+
+export type BikeControllerControlId =
+  | 'SHIFT_UP'
+  | 'SHIFT_DOWN'
+  | 'DPAD_UP'
+  | 'DPAD_DOWN'
+  | 'DPAD_LEFT'
+  | 'DPAD_RIGHT'
+  | 'BUTTON_A'
+  | 'BUTTON_B'
+  | 'BUTTON_Y'
+  | 'BUTTON_Z'
+  | 'ON_OFF_HOME'
+  | 'STEER_AXIS'
+  | 'BRAKE_AXIS';
+
+export type BikeControllerDeviceModel =
+  | 'ZWIFT_CLICK'
+  | 'ZWIFT_PLAY_LEFT'
+  | 'ZWIFT_PLAY_RIGHT'
+  | 'GENERIC_OBC';
+
+export interface BikeControllerEvent {
+  timestampMs: number;
+  deviceId: string;
+  deviceModel: BikeControllerDeviceModel;
+  control: BikeControllerControlId;
+  state: 'PRESSED' | 'RELEASED' | 'HELD' | 'AXIS_CHANGE';
+  /** Normalized value: 1/0 for digital buttons, -1.0..+1.0 for steering, 0.0..1.0 for brake */
+  value: number;
+}
 
 export interface ConnectedSensorDevice {
   id: string;
@@ -73,6 +105,15 @@ export interface VeloCoreBackendHook {
   onIntervalComplete?: (summary: IntervalCompletionSummary) => void;
   onRideStateChange?: (isRiding: boolean, snapshot: TelemetrySnapshot) => void;
   onSessionReset?: () => void;
+  /**
+   * Invoked when an OpenBikeControl / handlebar controller event is ingested.
+   * Return `{ preventDefault: true }` to intercept the input and skip default trainer actions
+   * (such as virtual gear shifting or ERG intensity bias nudging).
+   */
+  onControllerInput?: (
+    event: BikeControllerEvent,
+    snapshot: TelemetrySnapshot
+  ) => { preventDefault?: boolean } | void;
 }
 
 export interface TelemetrySnapshot {
@@ -94,12 +135,16 @@ export interface TelemetrySnapshot {
   maxPowerWatts: number;
   wattsPerKg: number;
 
-  // Target, Trainer State & Interval Compliance
+  // Target, Trainer State, Virtual Shifting & Interval Compliance
   targetPowerWatts: number;
   trainerMode: TrainerControlMode;
   targetSlopePct: number;
   targetResistancePct: number;
   intensityBiasPct: number;
+  virtualGear: number; // 1..24 (default 12)
+  virtualGearRatio: number; // e.g. 1.000 at Gear 12
+  steeringAngleNormalized: number; // -1.0 (left) .. +1.0 (right)
+  brakeNormalized: number; // 0.0 (released) .. 1.0 (full brake)
   intervalCompliancePct: number;
   intervalCadenceCompliancePct: number;
 

@@ -168,7 +168,7 @@ pub fn decode_ant_frame(
     }
 }
 
-/// Decodes a raw BLE GATT characteristic notification (`0x2A63`, `0x2AD2`, `0x2A37`).
+/// Decodes a raw BLE GATT characteristic notification (`0x2A63`, `0x2AD2`, `0x2A5B`, `0x2A37`).
 pub fn decode_ble_frame(
     char_uuid: u32,
     raw: &[u8],
@@ -184,17 +184,34 @@ pub fn decode_ble_frame(
     };
 
     if char_uuid == 0x2A63 && raw.len() >= 4 {
+        // BLE Cycling Power Measurement (0x2A63)
+        // Bit 0 (0x0001): Pedal Power Balance Present (1 byte)
+        // Bit 2 (0x0004): Accumulated Torque Present (2 bytes)
+        // Bit 4 (0x0010): Wheel Revolution Data Present (6 bytes)
+        // Bit 5 (0x0020): Crank Revolution Data Present (4 bytes)
+        let flags = u16::from_le_bytes([raw[0], raw[1]]);
         let inst_watts = i16::from_le_bytes([raw[2], raw[3]]).max(0) as u16;
         metrics.power_watts = inst_watts.min(2500);
         metrics.update_mask |= MASK_POWER;
 
-        if raw.len() >= 5 && raw[4] > 0 && raw[4] <= 200 {
-            metrics.lr_balance_pct = raw[4] / 2;
-            metrics.update_mask |= MASK_BALANCE;
+        let mut offset = 4usize;
+        if (flags & 0x0001) != 0 && raw.len() >= offset + 1 {
+            let bal_half_pct = raw[offset];
+            if bal_half_pct > 0 && bal_half_pct <= 200 {
+                metrics.lr_balance_pct = bal_half_pct / 2;
+                metrics.update_mask |= MASK_BALANCE;
+            }
+            offset += 1;
         }
-        if raw.len() >= 9 {
-            let crank_revs = u16::from_le_bytes([raw[5], raw[6]]) as u32;
-            let crank_time_1024 = u16::from_le_bytes([raw[7], raw[8]]) as u32;
+        if (flags & 0x0004) != 0 {
+            offset += 2; // Skip Accumulated Torque (uint16)
+        }
+        if (flags & 0x0010) != 0 {
+            offset += 6; // Skip Wheel Revolution Data (uint32 + uint16)
+        }
+        if (flags & 0x0020) != 0 && raw.len() >= offset + 4 {
+            let crank_revs = u16::from_le_bytes([raw[offset], raw[offset + 1]]) as u32;
+            let crank_time_1024 = u16::from_le_bytes([raw[offset + 2], raw[offset + 3]]) as u32;
             if *prev_ble_crank_revs >= 0 {
                 let rev_delta = u16_rollover_delta(crank_revs, *prev_ble_crank_revs as u32);
                 let time_delta = u16_rollover_delta(crank_time_1024, *prev_ble_crank_time_1024);
@@ -211,15 +228,93 @@ pub fn decode_ble_frame(
             *prev_ble_crank_time_1024 = crank_time_1024;
         }
         Some(metrics)
-    } else if char_uuid == 0x2AD2 && raw.len() >= 8 {
-        let raw_speed = u16::from_le_bytes([raw[2], raw[3]]); // 0.01 km/h
-        let raw_cadence = u16::from_le_bytes([raw[4], raw[5]]); // 0.5 rpm
-        let raw_power = i16::from_le_bytes([raw[6], raw[7]]).max(0) as u16;
+    } else if char_uuid == 0x2AD2 && raw.len() >= 4 {
+        // BLE FTMS Indoor Bike Data (0x2AD2) — Bitmask-driven field layout per Bluetooth SIG spec
+        // Bit 0 (0x0001): More Data (0 = Instantaneous Speed present, 1 = Not present)
+        // Bit 1 (0x0002): Average Speed present (2 bytes)
+        // Bit 2 (0x0004): Instantaneous Cadence present (2 bytes, 0.5 rpm)
+        // Bit 3 (0x0008): Average Cadence present (2 bytes)
+        // Bit 4 (0x0010): Total Distance present (3 bytes, uint24)
+        // Bit 5 (0x0020): Resistance Level present (2 bytes, sint16)
+        // Bit 6 (0x0040): Instantaneous Power present (2 bytes, sint16)
+        // Bit 7 (0x0080): Average Power present (2 bytes, sint16)
+        // Bit 8 (0x0100): Expended Energy present (5 bytes: uint16 + uint16 + uint8)
+        // Bit 9 (0x0200): Heart Rate present (1 byte, uint8)
+        let flags = u16::from_le_bytes([raw[0], raw[1]]);
+        let mut offset = 2usize;
 
-        metrics.speed_tenths_kph = (raw_speed / 10).min(1200);
-        metrics.cadence_rpm = (raw_cadence / 2).min(240) as u8;
-        metrics.power_watts = raw_power.min(2500);
-        metrics.update_mask |= MASK_SPEED | MASK_CADENCE | MASK_POWER;
+        // Bit 0 == 0 means Instantaneous Speed is present!
+        if (flags & 0x0001) == 0 && raw.len() >= offset + 2 {
+            let raw_speed = u16::from_le_bytes([raw[offset], raw[offset + 1]]); // 0.01 km/h
+            metrics.speed_tenths_kph = (raw_speed / 10).min(1200);
+            metrics.update_mask |= MASK_SPEED;
+            offset += 2;
+        }
+        if (flags & 0x0002) != 0 {
+            offset += 2; // Average Speed
+        }
+        if (flags & 0x0004) != 0 && raw.len() >= offset + 2 {
+            let raw_cadence = u16::from_le_bytes([raw[offset], raw[offset + 1]]); // 0.5 rpm
+            metrics.cadence_rpm = (raw_cadence / 2).min(240) as u8;
+            metrics.update_mask |= MASK_CADENCE;
+            offset += 2;
+        }
+        if (flags & 0x0008) != 0 {
+            offset += 2; // Average Cadence
+        }
+        if (flags & 0x0010) != 0 {
+            offset += 3; // Total Distance (uint24)
+        }
+        if (flags & 0x0020) != 0 {
+            offset += 2; // Resistance Level (sint16)
+        }
+        if (flags & 0x0040) != 0 && raw.len() >= offset + 2 {
+            let raw_power = i16::from_le_bytes([raw[offset], raw[offset + 1]]).max(0) as u16;
+            metrics.power_watts = raw_power.min(2500);
+            metrics.update_mask |= MASK_POWER;
+            offset += 2;
+        }
+        if (flags & 0x0080) != 0 {
+            offset += 2; // Average Power
+        }
+        if (flags & 0x0100) != 0 {
+            offset += 5; // Expended Energy
+        }
+        if (flags & 0x0200) != 0 && raw.len() >= offset + 1 {
+            let bpm = raw[offset];
+            if bpm > 30 && bpm < 245 {
+                metrics.heart_rate_bpm = bpm;
+                metrics.update_mask |= MASK_HR;
+            }
+        }
+        Some(metrics)
+    } else if char_uuid == 0x2A5B && raw.len() >= 5 {
+        // BLE Cycling Speed and Cadence Measurement (0x2A5B)
+        // Bit 0 (0x01): Wheel Revolution Data Present (uint32 wheel revs + uint16 wheel time 1/1024s = 6 bytes)
+        // Bit 1 (0x02): Crank Revolution Data Present (uint16 crank revs + uint16 crank time 1/1024s = 4 bytes)
+        let flags = raw[0];
+        let mut offset = 1usize;
+        if (flags & 0x01) != 0 {
+            offset += 6;
+        }
+        if (flags & 0x02) != 0 && raw.len() >= offset + 4 {
+            let crank_revs = u16::from_le_bytes([raw[offset], raw[offset + 1]]) as u32;
+            let crank_time_1024 = u16::from_le_bytes([raw[offset + 2], raw[offset + 3]]) as u32;
+            if *prev_ble_crank_revs >= 0 {
+                let rev_delta = u16_rollover_delta(crank_revs, *prev_ble_crank_revs as u32);
+                let time_delta = u16_rollover_delta(crank_time_1024, *prev_ble_crank_time_1024);
+                if rev_delta > 0 && time_delta > 0 {
+                    let rpm =
+                        ((rev_delta as f64 * 1024.0 * 60.0) / (time_delta as f64)).round() as u32;
+                    if (30..=195).contains(&rpm) {
+                        metrics.cadence_rpm = rpm as u8;
+                        metrics.update_mask |= MASK_CADENCE;
+                    }
+                }
+            }
+            *prev_ble_crank_revs = crank_revs as i32;
+            *prev_ble_crank_time_1024 = crank_time_1024;
+        }
         Some(metrics)
     } else if char_uuid == 0x2A37 && raw.len() >= 2 {
         let flags = raw[0];
